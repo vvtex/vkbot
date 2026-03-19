@@ -3,9 +3,9 @@
 
 """
 ВКонтакте бот для сбора потребностей в услугах по продвижению сайтов.
-Версия 1.0
-Разработан в соответствии с ТЗ.
+Версия 1.1 (с использованием переменных окружения)
 """
+
 import os
 import sqlite3
 import logging
@@ -13,7 +13,6 @@ import threading
 import time
 import csv
 import io
-
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
@@ -22,32 +21,33 @@ from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
 from vk_api.keyboard import VkKeyboard, VkKeyboardColor
 from vk_api.utils import get_random_id
 
-# ================== КОНФИГУРАЦИЯ (замените на свои данные) ==================
-#VK_GROUP_ID = '123456789'                # ID группы ВК
-#VK_API_TOKEN = 'vk1.a.xxxxxxxxxxxx'      # Токен сообщества (ключ доступа)
-#ADMIN_IDS = [123456, 789012]              # ID администраторов ВК (можно добавить позже через БД)
-
-
-
 # ================== КОНФИГУРАЦИЯ (переменные окружения) ==================
-# Получение значений из переменных окружения с запасными значениями по умолчанию
-VK_GROUP_ID = os.getenv('VK_GROUP_ID')           # ID группы ВК
-VK_API_TOKEN = os.getenv('VK_API_TOKEN') # Токен сообщества
+# Обязательные переменные
+VK_GROUP_ID = os.getenv('VK_GROUP_ID')
+VK_API_TOKEN = os.getenv('VK_API_TOKEN')
+admin_ids_str = os.getenv('ADMIN_IDS', '')
 
-# Список администраторов: ожидается строка с ID, разделёнными запятыми, например "123456,789012"
-admin_ids_str = os.getenv('ADMIN_IDS')
-ADMIN_IDS = [int(id.strip()) for id in admin_ids_str.split(',') if id.strip().isdigit()]
+if not VK_GROUP_ID or not VK_API_TOKEN:
+    raise ValueError("Не заданы обязательные переменные окружения VK_GROUP_ID и/или VK_API_TOKEN")
 
-# Настройки базы данных
-DB_FILE = 'bot_database.db'
+# Преобразуем строку с ID администраторов в список целых чисел
+ADMIN_IDS = []
+if admin_ids_str.strip():
+    for part in admin_ids_str.split(','):
+        part = part.strip()
+        if part.isdigit():
+            ADMIN_IDS.append(int(part))
+        else:
+            logging.warning(f"Некорректный ID администратора пропущен: {part}")
 
-# Настройки рассылки (по умолчанию)
-DEFAULT_MAILING_TIME = "10:00"            # Время ежедневной рассылки
-MAILING_CHECK_INTERVAL = 60               # Интервал проверки расписания (сек)
+# Остальные настройки (можно менять через переменные окружения при необходимости)
+DB_FILE = os.getenv('DB_FILE', 'bot_database.db')
+DEFAULT_MAILING_TIME = os.getenv('DEFAULT_MAILING_TIME', '10:00')
+MAILING_CHECK_INTERVAL = int(os.getenv('MAILING_CHECK_INTERVAL', '60'))
 
 # Флаг для отключения бота (команда /disable)
 BOT_ENABLED = True
-BOT_DISABLED_UNTIL = None                 # Если не None, время, до которого бот отключен
+BOT_DISABLED_UNTIL = None
 
 # Настройка логирования
 logging.basicConfig(
@@ -139,7 +139,7 @@ def init_db():
         )
     ''')
 
-    # Добавляем администраторов из списка ADMIN_IDS, если их нет
+    # Добавляем администраторов из ADMIN_IDS, если их нет
     for admin_id in ADMIN_IDS:
         cur.execute('INSERT OR IGNORE INTO admins (vk_id) VALUES (?)', (admin_id,))
 
@@ -436,9 +436,6 @@ class VKBot:
         """Обрабатывает текстовое сообщение от пользователя."""
         user_id = event.message['from_id']
         text = event.message['text'].strip()
-        # Получаем информацию о пользователе (имя, фамилию) из события, если есть
-        # В VkBotEventType.MESSAGE_NEW может быть информация о пользователе
-        # Для простоты можем запросить отдельно, но пока используем то, что есть
         first_name = event.message.get('first_name', '')
         last_name = event.message.get('last_name', '')
         user = get_or_create_user(user_id, first_name, last_name)
@@ -478,12 +475,10 @@ class VKBot:
 
         # Сохраняем ответ в зависимости от состояния
         if state == 'q1':
-            # Вопрос 1: Есть ли сайт? Да/Нет
             if text not in ['Да', 'Нет']:
                 self.send_message(user_id, "Пожалуйста, выберите один из вариантов на кнопках.")
                 return
             save_answer(user_id, 'Есть ли у вас сайт?', text)
-            # Переход к следующему вопросу
             update_user_state(user_id, 'q2')
             msg = "Вопрос 2: Нужно ли провести аудит сайта?"
             kb = get_keyboard_audit()
@@ -514,7 +509,6 @@ class VKBot:
                 self.send_message(user_id, "Пожалуйста, выберите один из вариантов на кнопках.")
                 return
             save_answer(user_id, 'Вам нужна реклама или только аудит?', text)
-            # Опрос завершён, спрашиваем про подписку
             update_user_state(user_id, 'subscribe')
             msg = ("Спасибо за ответы! Мы свяжемся с вами в ближайшее время.\n"
                    "Хотите получать информацию о наших акциях?")
@@ -527,16 +521,14 @@ class VKBot:
                 return
             subscribed = (text == 'Да')
             set_subscription(user_id, subscribed)
-            update_user_state(user_id, None)  # завершаем опрос
+            update_user_state(user_id, None)
             if subscribed:
                 msg = "Отлично! Вы подписались на акции. Будем присылать самое интересное."
             else:
                 msg = "Хорошо, если передумаете - всегда можете написать мне."
             self.send_message(user_id, msg, get_empty_keyboard())
-            # Дополнительно можно записать в лог админа, но это не требуется
 
         else:
-            # Неизвестное состояние - сброс
             logger.warning(f"Неизвестное состояние {state} для пользователя {user_id}, сбрасываем.")
             update_user_state(user_id, None)
             self.send_welcome(user_id)
@@ -546,36 +538,26 @@ class VKBot:
         """Обрабатывает команды администратора."""
         user_id = event.message['from_id']
         text = event.message['text'].strip()
-
-        # Разбиваем команду и аргументы
         parts = text.split()
         cmd = parts[0].lower()
         args = parts[1:]
 
-        # Проверяем, не находится ли админ в процессе ввода данных (добавление акции и т.п.)
         if user_id in self.admin_states:
             self.handle_admin_state_input(event)
             return
 
-        # Обработка команд
         if cmd == '/start' or cmd == '/help':
             self.send_admin_help(user_id)
-
         elif cmd == '/stats':
             self.admin_stats(user_id)
-
         elif cmd == '/answers':
             self.admin_answers(user_id, args)
-
         elif cmd == '/export':
             self.admin_export(user_id)
-
         elif cmd == '/add_promo':
             self.start_add_promo(user_id)
-
         elif cmd == '/list_promo':
             self.admin_list_promos(user_id)
-
         elif cmd == '/edit_promo':
             if len(args) < 1:
                 self.send_message(user_id, "Использование: /edit_promo <id>")
@@ -585,7 +567,6 @@ class VKBot:
                 self.start_edit_promo(user_id, promo_id)
             except ValueError:
                 self.send_message(user_id, "ID акции должен быть числом.")
-
         elif cmd == '/delete_promo':
             if len(args) < 1:
                 self.send_message(user_id, "Использование: /delete_promo <id>")
@@ -595,7 +576,6 @@ class VKBot:
                 self.admin_delete_promo(user_id, promo_id)
             except ValueError:
                 self.send_message(user_id, "ID акции должен быть числом.")
-
         elif cmd == '/send_promo':
             if len(args) < 1:
                 self.send_message(user_id, "Использование: /send_promo <id>")
@@ -605,13 +585,11 @@ class VKBot:
                 self.admin_send_promo_manual(user_id, promo_id)
             except ValueError:
                 self.send_message(user_id, "ID акции должен быть числом.")
-
         elif cmd == '/set_mailing_time':
             if len(args) < 1:
                 self.send_message(user_id, "Использование: /set_mailing_time <HH:MM>")
                 return
             self.admin_set_mailing_time(user_id, args[0])
-
         elif cmd == '/reply':
             if len(args) < 2:
                 self.send_message(user_id, "Использование: /reply <vk_id> <текст>")
@@ -619,18 +597,14 @@ class VKBot:
             target_vk_id = args[0]
             reply_text = ' '.join(args[1:])
             self.admin_reply(user_id, target_vk_id, reply_text)
-
         elif cmd == '/disable':
             self.admin_disable(user_id)
-
         elif cmd == '/enable':
             self.admin_enable(user_id)
-
         else:
             self.send_message(user_id, "Неизвестная команда. Введите /help для списка команд.")
 
     def send_admin_help(self, user_id):
-        """Отправляет справку по командам администратора."""
         help_text = (
             "🔧 **Команды администратора**\n"
             "/stats - статистика пользователей\n"
@@ -649,7 +623,6 @@ class VKBot:
         self.send_message(user_id, help_text)
 
     def admin_stats(self, user_id):
-        """Выводит статистику."""
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute('SELECT COUNT(*) as total FROM users')
@@ -667,10 +640,9 @@ class VKBot:
         log_admin_action(user_id, 'stats', msg)
 
     def admin_answers(self, user_id, args):
-        """Показывает ответы пользователей (с возможностью фильтра по дате)."""
         date_filter = None
         if args:
-            date_filter = args[0]  # ожидаем YYYY-MM-DD
+            date_filter = args[0]
         conn = get_db_connection()
         cur = conn.cursor()
         if date_filter:
@@ -694,13 +666,11 @@ class VKBot:
         if not rows:
             self.send_message(user_id, "Нет ответов за указанный период.")
             return
-        # Формируем сообщение частями, т.к. может быть много данных
         msg_lines = ["📝 **Ответы пользователей**:"]
         for row in rows:
             line = (f"[{row['answered_at']}] {row['first_name']} {row['last_name']} (id{row['vk_id']}):\n"
                     f"  {row['question']} → {row['answer']}")
             msg_lines.append(line)
-        # Отправляем по частям, не более 4-5 ответов за раз из-за лимита длины
         chunk_size = 5
         for i in range(0, len(msg_lines), chunk_size):
             chunk = '\n\n'.join(msg_lines[i:i+chunk_size])
@@ -708,7 +678,6 @@ class VKBot:
         log_admin_action(user_id, 'answers', f"date={date_filter if date_filter else 'all'}")
 
     def admin_export(self, user_id):
-        """Экспорт данных в CSV и отправка файлом."""
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute('''
@@ -723,7 +692,6 @@ class VKBot:
         if not rows:
             self.send_message(user_id, "Нет данных для экспорта.")
             return
-        # Создаем CSV в памяти
         output = io.StringIO()
         writer = csv.writer(output)
         writer.writerow(['vk_id', 'first_name', 'last_name', 'first_seen', 'last_interaction', 'subscribed',
@@ -734,19 +702,14 @@ class VKBot:
                              row['answered_at']])
         csv_data = output.getvalue().encode('utf-8-sig')
         output.close()
-        # Отправляем файл
         self.upload_and_send_document(user_id, csv_data, 'survey_export.csv')
         log_admin_action(user_id, 'export', 'CSV exported')
 
     def upload_and_send_document(self, user_id, file_data, filename):
-        """Загружает документ на сервер ВК и отправляет пользователю."""
         try:
-            # Получаем адрес сервера для загрузки
             upload_server = self.vk.docs.getMessagesUploadServer(type='doc', peer_id=user_id)['upload_url']
-            # Загружаем файл
             with io.BytesIO(file_data) as f:
                 response = vk_api.uploader.upload(upload_server, {'file': (filename, f)})
-            # Сохраняем документ
             doc = self.vk.docs.save(file=response['file'], title=filename)['doc']
             attachment = f"doc{doc['owner_id']}_{doc['id']}"
             self.send_message(user_id, "Файл с данными:", attachment=attachment)
@@ -756,24 +719,20 @@ class VKBot:
 
     # ---------- Управление акциями (админ) ----------
     def start_add_promo(self, user_id):
-        """Начинает процесс добавления акции: запрашивает название."""
         self.admin_states[user_id] = {'action': 'add_promo', 'step': 1, 'data': {}}
         self.send_message(user_id, "Введите **название** акции:")
 
     def start_edit_promo(self, user_id, promo_id):
-        """Начинает процесс редактирования акции."""
         promo = get_promotion(promo_id)
         if not promo:
             self.send_message(user_id, f"Акция с ID {promo_id} не найдена.")
             return
         self.admin_states[user_id] = {'action': 'edit_promo', 'step': 1, 'data': promo, 'promo_id': promo_id}
-        # Показываем текущие данные и предлагаем ввести новое название (или оставить)
         self.send_message(user_id, f"Редактирование акции ID {promo_id}\n"
                                    f"Текущее название: {promo['title']}\n"
                                    "Введите новое название (или отправьте 'пропустить'):")
 
     def handle_admin_state_input(self, event):
-        """Обрабатывает ввод данных от администратора в процессе создания/редактирования."""
         user_id = event.message['from_id']
         text = event.message['text'].strip()
         state = self.admin_states.get(user_id)
@@ -786,23 +745,18 @@ class VKBot:
             self.handle_edit_promo_input(user_id, text, state)
 
     def handle_add_promo_input(self, user_id, text, state):
-        """Пошаговый сбор данных для новой акции."""
         step = state['step']
         data = state['data']
 
         if step == 1:
-            # Получили название
             data['title'] = text
             state['step'] = 2
             self.send_message(user_id, "Введите **текст** акции (описание, условия):")
-
         elif step == 2:
             data['text'] = text
             state['step'] = 3
             self.send_message(user_id, "Введите **дату начала** в формате ГГГГ-ММ-ДД (например, 2025-04-01):")
-
         elif step == 3:
-            # Проверка формата даты
             try:
                 datetime.strptime(text, '%Y-%m-%d')
                 data['start_date'] = text
@@ -811,7 +765,6 @@ class VKBot:
             except ValueError:
                 self.send_message(user_id, "Неверный формат даты. Повторите ввод (ГГГГ-ММ-ДД):")
                 return
-
         elif step == 4:
             try:
                 datetime.strptime(text, '%Y-%m-%d')
@@ -821,40 +774,34 @@ class VKBot:
             except ValueError:
                 self.send_message(user_id, "Неверный формат даты. Повторите ввод (ГГГГ-ММ-ДД):")
                 return
-
         elif step == 5:
             if text.lower() not in ['daily', 'weekly']:
                 self.send_message(user_id, "Периодичность должна быть 'daily' или 'weekly'. Повторите:")
                 return
             data['periodicity'] = text.lower()
-            # Сохраняем акцию
             promo_id = add_promotion(data['title'], data['text'], data['start_date'], data['end_date'], data['periodicity'])
             self.send_message(user_id, f"✅ Акция успешно добавлена! ID: {promo_id}")
             log_admin_action(user_id, 'add_promo', f"promo_id={promo_id}, title={data['title']}")
-            # Удаляем состояние
             del self.admin_states[user_id]
 
     def handle_edit_promo_input(self, user_id, text, state):
-        """Редактирование полей акции с возможностью пропустить."""
         step = state['step']
         promo_id = state['promo_id']
         current = state['data']
 
-        if step == 1:  # название
+        if step == 1:
             if text.lower() != 'пропустить':
                 update_promotion(promo_id, title=text)
                 current['title'] = text
             state['step'] = 2
             self.send_message(user_id, f"Текущий текст: {current['text']}\nВведите новый текст акции (или 'пропустить'):")
-
-        elif step == 2:  # текст
+        elif step == 2:
             if text.lower() != 'пропустить':
                 update_promotion(promo_id, text=text)
                 current['text'] = text
             state['step'] = 3
             self.send_message(user_id, f"Текущая дата начала: {current['start_date']}\nВведите новую дату начала (ГГГГ-ММ-ДД) или 'пропустить':")
-
-        elif step == 3:  # дата начала
+        elif step == 3:
             if text.lower() != 'пропустить':
                 try:
                     datetime.strptime(text, '%Y-%m-%d')
@@ -864,8 +811,7 @@ class VKBot:
                     self.send_message(user_id, "Неверный формат даты. Поле не обновлено.")
             state['step'] = 4
             self.send_message(user_id, f"Текущая дата окончания: {current['end_date']}\nВведите новую дату окончания (ГГГГ-ММ-ДД) или 'пропустить':")
-
-        elif step == 4:  # дата окончания
+        elif step == 4:
             if text.lower() != 'пропустить':
                 try:
                     datetime.strptime(text, '%Y-%m-%d')
@@ -875,8 +821,7 @@ class VKBot:
                     self.send_message(user_id, "Неверный формат даты. Поле не обновлено.")
             state['step'] = 5
             self.send_message(user_id, f"Текущая периодичность: {current['periodicity']}\nВведите новую периодичность (daily/weekly) или 'пропустить':")
-
-        elif step == 5:  # периодичность
+        elif step == 5:
             if text.lower() != 'пропустить' and text.lower() in ['daily', 'weekly']:
                 update_promotion(promo_id, periodicity=text.lower())
                 current['periodicity'] = text.lower()
@@ -887,7 +832,6 @@ class VKBot:
             del self.admin_states[user_id]
 
     def admin_list_promos(self, user_id):
-        """Выводит список всех акций."""
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute('SELECT id, title, start_date, end_date, is_active, periodicity FROM promotions ORDER BY created_at DESC')
@@ -903,7 +847,6 @@ class VKBot:
         self.send_message(user_id, '\n'.join(msg_lines))
 
     def admin_delete_promo(self, user_id, promo_id):
-        """Удаляет акцию."""
         promo = get_promotion(promo_id)
         if not promo:
             self.send_message(user_id, f"Акция с ID {promo_id} не найдена.")
@@ -913,7 +856,6 @@ class VKBot:
         log_admin_action(user_id, 'delete_promo', f"promo_id={promo_id}")
 
     def admin_send_promo_manual(self, user_id, promo_id):
-        """Ручная рассылка акции всем подписчикам."""
         promo = get_promotion(promo_id)
         if not promo:
             self.send_message(user_id, f"Акция с ID {promo_id} не найдена.")
@@ -924,25 +866,20 @@ class VKBot:
             return
         sent_count = 0
         for sub in subscribers:
-            # Проверяем, отправлялась ли уже сегодня (если daily) или на неделе (weekly)
             if promo['periodicity'] == 'daily' and was_sent_today(promo_id, sub['id']):
                 continue
             if promo['periodicity'] == 'weekly' and was_sent_this_week(promo_id, sub['id']):
                 continue
-            # Отправляем
             msg = f"🎉 **Акция: {promo['title']}**\n\n{promo['text']}"
             self.send_message(sub['vk_id'], msg)
             log_sent(promo_id, sub['id'])
             sent_count += 1
-            # Небольшая задержка, чтобы не превысить лимиты
             time.sleep(0.3)
-        # Обновляем last_sent
         update_promotion(promo_id, last_sent=datetime.now().isoformat())
         self.send_message(user_id, f"✅ Рассылка завершена. Отправлено {sent_count} подписчикам.")
         log_admin_action(user_id, 'manual_send', f"promo_id={promo_id}, sent={sent_count}")
 
     def admin_set_mailing_time(self, user_id, time_str):
-        """Устанавливает время автоматической рассылки."""
         try:
             datetime.strptime(time_str, '%H:%M')
             global DEFAULT_MAILING_TIME
@@ -953,7 +890,6 @@ class VKBot:
             self.send_message(user_id, "Неверный формат времени. Используйте HH:MM (например, 10:00)")
 
     def admin_reply(self, admin_id, target_vk_id, text):
-        """Отправляет сообщение указанному пользователю от имени бота."""
         try:
             target_vk_id = int(target_vk_id)
             self.send_message(target_vk_id, f"📨 Сообщение от администратора:\n{text}")
@@ -965,14 +901,12 @@ class VKBot:
             self.send_message(admin_id, f"Ошибка при отправке: {e}")
 
     def admin_disable(self, user_id):
-        """Отключает бота (глобально)."""
         self.enabled = False
         self.disabled_until = None
         self.send_message(user_id, "🚫 Бот отключен. Для включения используйте /enable")
         log_admin_action(user_id, 'disable')
 
     def admin_enable(self, user_id):
-        """Включает бота."""
         self.enabled = True
         self.disabled_until = None
         self.send_message(user_id, "✅ Бот включен.")
@@ -980,16 +914,13 @@ class VKBot:
 
     # ============= АВТОМАТИЧЕСКАЯ РАССЫЛКА ===================================
     def mailing_worker(self):
-        """Фоновый поток, проверяющий расписание и запускающий рассылку."""
         logger.info("Поток рассылки запущен.")
         while True:
             try:
                 now = datetime.now()
-                # Проверяем, совпадает ли текущее время с настроенным временем рассылки
                 target_time = datetime.strptime(DEFAULT_MAILING_TIME, '%H:%M').time()
                 if now.hour == target_time.hour and now.minute == target_time.minute:
                     self.perform_mailing()
-                    # Ждем минуту, чтобы не запустить повторно в ту же минуту
                     time.sleep(61)
                 else:
                     time.sleep(MAILING_CHECK_INTERVAL)
@@ -998,7 +929,6 @@ class VKBot:
                 time.sleep(60)
 
     def perform_mailing(self):
-        """Выполняет рассылку активных акций подписчикам."""
         logger.info("Запуск автоматической рассылки.")
         if self.is_bot_disabled():
             logger.info("Бот отключен, рассылка не производится.")
@@ -1014,9 +944,6 @@ class VKBot:
             logger.info("Нет подписчиков.")
             return
 
-        # Для каждого подписчика выбираем акцию, которую ещё не отправляли в текущем периоде
-        # (если несколько акций - отправляем одну, можно ротировать по дате последней отправки)
-        # Простейший вариант: отправляем первую подходящую акцию.
         for sub in subscribers:
             sent = False
             for promo in active_promos:
@@ -1025,16 +952,13 @@ class VKBot:
                     continue
                 if promo['periodicity'] == 'weekly' and was_sent_this_week(promo_id, sub['id']):
                     continue
-                # Отправляем
                 msg = f"🎉 **Акция: {promo['title']}**\n\n{promo['text']}"
                 self.send_message(sub['vk_id'], msg)
                 log_sent(promo_id, sub['id'])
                 sent = True
-                # Обновляем last_sent у акции
                 update_promotion(promo_id, last_sent=datetime.now().isoformat())
-                # Небольшая задержка
                 time.sleep(0.3)
-                break  # Отправили одну акцию пользователю
+                break
             if not sent:
                 logger.debug(f"Пользователь {sub['vk_id']} уже получил все акции в этом периоде.")
 
@@ -1045,7 +969,6 @@ def main():
     init_db()
     bot = VKBot(VK_GROUP_ID, VK_API_TOKEN)
 
-    # Запускаем поток рассылки
     mailing_thread = threading.Thread(target=bot.mailing_worker, daemon=True)
     mailing_thread.start()
 
