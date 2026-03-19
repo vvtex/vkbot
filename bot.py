@@ -3,7 +3,7 @@
 
 """
 ВКонтакте бот для сбора потребностей в услугах по продвижению сайтов.
-Версия 2.4 (исправлена обработка кнопок «Начать» / «Не сейчас»)
+Версия 3.0 (полное соответствие ТЗ: главное меню, заявки, админ-панель, экспорт CSV)
 """
 
 import os
@@ -22,6 +22,7 @@ try:
     from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
     from vk_api.keyboard import VkKeyboard, VkKeyboardColor
     from vk_api.utils import get_random_id
+    from vk_api import VkUpload
 except ImportError:
     print("="*60)
     print("ОШИБКА: не установлена библиотека vk_api.")
@@ -106,7 +107,7 @@ BOT_DISABLED_UNTIL = None
 
 # ================== РАБОТА С БАЗОЙ ДАННЫХ ==================================
 def init_db():
-    """Создание таблиц, если их нет."""
+    """Создание таблиц, если их нет (добавлена таблица requests)."""
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
 
@@ -132,6 +133,18 @@ def init_db():
             question TEXT NOT NULL,
             answer TEXT NOT NULL,
             answered_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+        )
+    ''')
+
+    # Таблица заявок (новая)
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            request_text TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            status TEXT DEFAULT 'new',
             FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
         )
     ''')
@@ -210,7 +223,7 @@ def get_or_create_user(vk_id, first_name='', last_name=''):
             'vk_id': vk_id,
             'first_name': first_name,
             'last_name': last_name,
-            'subscribed': False,
+            'subscribed': 0,
             'current_state': None
         }
 
@@ -221,6 +234,10 @@ def update_user_state(vk_id, state):
     cur.execute('UPDATE users SET current_state = ?, last_interaction = CURRENT_TIMESTAMP WHERE vk_id = ?', (state, vk_id))
     conn.commit()
     conn.close()
+
+def clear_user_state(vk_id):
+    """Сбросить состояние пользователя."""
+    update_user_state(vk_id, None)
 
 def save_answer(vk_id, question, answer):
     """Сохранить ответ пользователя на вопрос."""
@@ -237,6 +254,16 @@ def set_subscription(vk_id, subscribed):
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute('UPDATE users SET subscribed = ? WHERE vk_id = ?', (1 if subscribed else 0, vk_id))
+    conn.commit()
+    conn.close()
+
+def save_request(vk_id, request_text):
+    """Сохранить заявку от пользователя."""
+    user = get_or_create_user(vk_id)
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('INSERT INTO requests (user_id, request_text) VALUES (?, ?)',
+                (user['id'], request_text))
     conn.commit()
     conn.close()
 
@@ -277,6 +304,15 @@ def get_active_promotions():
         WHERE is_active = 1 AND start_date <= ? AND end_date >= ?
         ORDER BY created_at DESC
     ''', (today, today))
+    rows = cur.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+def get_all_promotions():
+    """Вернуть список всех акций."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('SELECT * FROM promotions ORDER BY created_at DESC')
     rows = cur.fetchall()
     conn.close()
     return [dict(row) for row in rows]
@@ -358,12 +394,43 @@ def was_sent_this_week(promo_id, user_id):
     return result
 
 # ================== КЛАВИАТУРЫ =============================================
-def get_keyboard_start():
-    """Клавиатура для первого сообщения."""
-    kb = VkKeyboard(one_time=True)
-    kb.add_button('Начать', color=VkKeyboardColor.POSITIVE)
-    kb.add_button('Не сейчас', color=VkKeyboardColor.NEGATIVE)
+def get_main_menu_keyboard():
+    """Клавиатура главного меню пользователя."""
+    kb = VkKeyboard(one_time=False)
+    kb.add_button('📢 Акции', color=VkKeyboardColor.PRIMARY)
+    kb.add_button('📝 Отправить заявку', color=VkKeyboardColor.PRIMARY)
+    kb.add_button('❓ Пройти опрос', color=VkKeyboardColor.PRIMARY)
     return kb.get_keyboard()
+
+def get_admin_keyboard():
+    """Клавиатура админ-панели."""
+    kb = VkKeyboard(one_time=False, inline=False)
+    # Первая строка: статистика, ответы, экспорт
+    kb.add_button('📊 Статистика', color=VkKeyboardColor.PRIMARY)
+    kb.add_button('📋 Ответы', color=VkKeyboardColor.PRIMARY)
+    kb.add_button('📤 Экспорт данных', color=VkKeyboardColor.PRIMARY)
+    kb.add_line()
+    # Вторая строка: управление акциями
+    kb.add_button('➕ Добавить акцию', color=VkKeyboardColor.POSITIVE)
+    kb.add_button('📋 Список акций', color=VkKeyboardColor.PRIMARY)
+    kb.add_button('✏️ Редактировать акцию', color=VkKeyboardColor.PRIMARY)
+    kb.add_line()
+    kb.add_button('❌ Удалить акцию', color=VkKeyboardColor.NEGATIVE)
+    kb.add_button('📨 Разослать акцию', color=VkKeyboardColor.POSITIVE)
+    kb.add_button('⏰ Установить время', color=VkKeyboardColor.PRIMARY)
+    kb.add_line()
+    # Третья строка: ответ пользователю, отключение/включение
+    kb.add_button('💬 Ответить пользователю', color=VkKeyboardColor.PRIMARY)
+    kb.add_button('🚫 Отключить бота', color=VkKeyboardColor.NEGATIVE)
+    kb.add_button('✅ Включить бота', color=VkKeyboardColor.POSITIVE)
+    kb.add_line()
+    # Кнопка возврата в главное меню пользователя
+    kb.add_button('🔙 Главное меню', color=VkKeyboardColor.SECONDARY)
+    return kb.get_keyboard()
+
+def get_empty_keyboard():
+    """Пустая клавиатура (убрать кнопки)."""
+    return VkKeyboard.get_empty_keyboard()
 
 def get_keyboard_yes_no():
     """Клавиатура Да/Нет."""
@@ -406,10 +473,6 @@ def get_keyboard_subscribe():
     kb.add_button('Нет', color=VkKeyboardColor.NEGATIVE)
     return kb.get_keyboard()
 
-def get_empty_keyboard():
-    """Пустая клавиатура (убрать кнопки)."""
-    return VkKeyboard.get_empty_keyboard()
-
 # ================== ОСНОВНОЙ КЛАСС БОТА ====================================
 class VKBot:
     def __init__(self, group_id, token):
@@ -430,11 +493,12 @@ class VKBot:
             sys.exit(1)
 
         self.vk = self.vk_session.get_api()
+        self.upload = VkUpload(self.vk_session)  # для загрузки документов
         self.enabled = BOT_ENABLED
         self.disabled_until = BOT_DISABLED_UNTIL
 
-        # Состояния админов для создания/редактирования акций
-        self.admin_states = {}  # vk_id -> {'action': 'add_promo', 'step': 0, 'data': {}}
+        # Состояния админов для создания/редактирования/удаления и т.д.
+        self.admin_states = {}  # vk_id -> {'action': ..., 'step': ..., 'data': ...}
 
     def send_message(self, user_id, message, keyboard=None, attachment=None):
         """Универсальный метод отправки сообщения с обработкой ошибок."""
@@ -478,36 +542,100 @@ class VKBot:
         last_name = event.message.get('last_name', '')
         user = get_or_create_user(user_id, first_name, last_name)
 
-        # Проверяем, является ли пользователь администратором и начинается ли сообщение с '/'
+        # Проверяем, есть ли активное состояние админа
+        if user_id in self.admin_states:
+            self.handle_admin_state_input(event)
+            return
+
+        # Если пользователь администратор и отправил команду с '/'
         if text.startswith('/') and is_admin(user_id):
             self.process_admin_command(event)
             return
 
-        # Если пользователь в процессе опроса (состояние не None)
+        # Если у пользователя есть состояние (опрос или заявка)
         if user['current_state']:
-            self.handle_survey_response(event, user)
+            self.handle_stateful_response(event, user)
             return
 
-        # Обычное сообщение (не команда и не в опросе)
-        # Проверяем, не нажал ли пользователь кнопки "Начать" или "Не сейчас"
-        if text == 'Начать':
-            self.start_survey(user_id)
-        elif text == 'Не сейчас':
-            self.send_message(user_id, "Хорошо, если захотите пройти опрос, просто напишите мне.", get_empty_keyboard())
-        else:
-            self.send_welcome(user_id)
+        # Проверяем, не хочет ли пользователь вернуться в главное меню
+        if text.lower() == 'меню':
+            self.send_main_menu(user_id)
+            return
 
-    def send_welcome(self, user_id):
-        """Отправляет приветственное сообщение с предложением опроса."""
-        msg = ("Здравствуйте! Я помогу подобрать услуги для продвижения вашего сайта.\n"
-               "Пройдём небольшой опрос?")
-        kb = get_keyboard_start()
+        # Обработка кнопок главного меню
+        if text == '📢 Акции':
+            self.show_promotions(user_id)
+        elif text == '📝 Отправить заявку':
+            self.start_request(user_id)
+        elif text == '❓ Пройти опрос':
+            self.start_survey(user_id)
+        else:
+            # Если сообщение не распознано, отправляем главное меню
+            self.send_main_menu(user_id)
+
+    # ============= МЕТОДЫ ДЛЯ ОБЫЧНЫХ ПОЛЬЗОВАТЕЛЕЙ =========================
+    def send_main_menu(self, user_id):
+        """Отправляет главное меню с тремя кнопками."""
+        msg = (
+            "🌟 **Добро пожаловать!** Я помогу вам подобрать услуги для продвижения вашего сайта.\n\n"
+            "Выберите действие:\n"
+            "─────────────────────\n"
+            "📢 **Акции** – посмотреть текущие предложения\n"
+            "📝 **Отправить заявку** – оставить контакт для связи\n"
+            "❓ **Пройти опрос** – ответить на несколько вопросов, чтобы мы лучше поняли ваши потребности"
+        )
+        kb = get_main_menu_keyboard()
         self.send_message(user_id, msg, kb)
+
+    def show_promotions(self, user_id):
+        """Показывает список активных акций."""
+        promos = get_active_promotions()
+        if not promos:
+            msg = "📢 На данный момент нет активных акций."
+            self.send_message(user_id, msg)
+        else:
+            lines = ["🎁 **Актуальные акции:**\n"]
+            for p in promos:
+                lines.append(
+                    f"**{p['title']}**\n"
+                    f"{p['text']}\n"
+                    f"📅 Срок: {p['start_date']} — {p['end_date']}\n"
+                    f"{'─'*30}"
+                )
+            full_msg = '\n'.join(lines)
+            self.send_message(user_id, full_msg)
+        # После показа акций возвращаем главное меню
+        self.send_main_menu(user_id)
+
+    def start_request(self, user_id):
+        """Начинает процесс заявки: устанавливает состояние и запрашивает контакт."""
+        update_user_state(user_id, 'request')
+        msg = "📝 Напишите ваше имя и контактный телефон/email, и мы свяжемся с вами."
+        # Убираем клавиатуру, чтобы пользователь мог ввести текст
+        self.send_message(user_id, msg, get_empty_keyboard())
+
+    def handle_request_response(self, user_id, text):
+        """Сохраняет заявку, уведомляет админов и возвращает в меню."""
+        save_request(user_id, text)
+        # Уведомляем всех администраторов
+        user = get_or_create_user(user_id)
+        notification = (
+            f"📬 **Новая заявка** от пользователя\n"
+            f"ID: {user_id}\n"
+            f"Имя: {user['first_name']} {user['last_name']}\n"
+            f"Текст: {text}"
+        )
+        for admin_id in ADMIN_IDS:
+            self.send_message(admin_id, notification)
+        # Подтверждение пользователю
+        self.send_message(user_id, "✅ Спасибо! Мы свяжемся с вами в ближайшее время.", get_empty_keyboard())
+        clear_user_state(user_id)
+        self.send_main_menu(user_id)
 
     def start_survey(self, user_id):
         """Начинает опрос: устанавливает состояние q1 и задаёт первый вопрос."""
         update_user_state(user_id, 'q1')
-        msg = "Вопрос 1: Есть ли у вас сайт?"
+        msg = "🔹 **Вопрос 1 из 4**\nЕсть ли у вас сайт?"
         kb = get_keyboard_yes_no()
         self.send_message(user_id, msg, kb)
 
@@ -517,14 +645,13 @@ class VKBot:
         state = user['current_state']
         text = event.message['text'].strip()
 
-        # Сохраняем ответ в зависимости от состояния
         if state == 'q1':
             if text not in ['Да', 'Нет']:
                 self.send_message(user_id, "Пожалуйста, выберите один из вариантов на кнопках.")
                 return
             save_answer(user_id, 'Есть ли у вас сайт?', text)
             update_user_state(user_id, 'q2')
-            msg = "Вопрос 2: Нужно ли провести аудит сайта?"
+            msg = "🔹 **Вопрос 2 из 4**\nНужно ли провести аудит сайта?"
             kb = get_keyboard_audit()
             self.send_message(user_id, msg, kb)
 
@@ -534,7 +661,7 @@ class VKBot:
                 return
             save_answer(user_id, 'Нужно ли провести аудит сайта?', text)
             update_user_state(user_id, 'q3')
-            msg = "Вопрос 3: Требуется ли переделать контент?"
+            msg = "🔹 **Вопрос 3 из 4**\nТребуется ли переделать контент?"
             kb = get_keyboard_content()
             self.send_message(user_id, msg, kb)
 
@@ -544,7 +671,7 @@ class VKBot:
                 return
             save_answer(user_id, 'Требуется ли переделать контент?', text)
             update_user_state(user_id, 'q4')
-            msg = "Вопрос 4: Вам нужна реклама или только аудит?"
+            msg = "🔹 **Вопрос 4 из 4**\nВам нужна реклама или только аудит?"
             kb = get_keyboard_advertising()
             self.send_message(user_id, msg, kb)
 
@@ -554,7 +681,7 @@ class VKBot:
                 return
             save_answer(user_id, 'Вам нужна реклама или только аудит?', text)
             update_user_state(user_id, 'subscribe')
-            msg = ("Спасибо за ответы! Мы свяжемся с вами в ближайшее время.\n"
+            msg = ("✅ Спасибо за ответы! Мы свяжемся с вами в ближайшее время.\n\n"
                    "Хотите получать информацию о наших акциях?")
             kb = get_keyboard_subscribe()
             self.send_message(user_id, msg, kb)
@@ -565,33 +692,48 @@ class VKBot:
                 return
             subscribed = (text == 'Да')
             set_subscription(user_id, subscribed)
-            update_user_state(user_id, None)
+            clear_user_state(user_id)
             if subscribed:
-                msg = "Отлично! Вы подписались на акции. Будем присылать самое интересное."
+                msg = "🔔 Отлично! Вы подписались на акции. Будем присылать самое интересное."
             else:
-                msg = "Хорошо, если передумаете - всегда можете написать мне."
+                msg = "⏸️ Хорошо, если передумаете - всегда можете написать мне."
             self.send_message(user_id, msg, get_empty_keyboard())
+            self.send_main_menu(user_id)
 
         else:
             logger.warning(f"Неизвестное состояние {state} для пользователя {user_id}, сбрасываем.")
-            update_user_state(user_id, None)
-            self.send_welcome(user_id)
+            clear_user_state(user_id)
+            self.send_main_menu(user_id)
+
+    def handle_stateful_response(self, event, user):
+        """Распределяет ответы в зависимости от текущего состояния."""
+        state = user['current_state']
+        if state.startswith('q') or state == 'subscribe':
+            self.handle_survey_response(event, user)
+        elif state == 'request':
+            self.handle_request_response(user['vk_id'], event.message['text'].strip())
+        else:
+            logger.warning(f"Неизвестное состояние {state}, сбрасываем")
+            clear_user_state(user['vk_id'])
+            self.send_main_menu(user['vk_id'])
 
     # ============= АДМИНИСТРИРОВАНИЕ ========================================
     def process_admin_command(self, event):
-        """Обрабатывает команды администратора."""
+        """Обрабатывает команды администратора (текстовые или от кнопок)."""
         user_id = event.message['from_id']
         text = event.message['text'].strip()
         parts = text.split()
         cmd = parts[0].lower()
         args = parts[1:]
 
+        # Если пользователь в админском диалоге, обрабатываем ввод
         if user_id in self.admin_states:
             self.handle_admin_state_input(event)
             return
 
-        if cmd == '/start' or cmd == '/help':
-            self.send_admin_help(user_id)
+        # Обработка текстовых команд
+        if cmd == '/admin' or cmd == '/start' or cmd == '/help':
+            self.show_admin_panel(user_id)
         elif cmd == '/stats':
             self.admin_stats(user_id)
         elif cmd == '/answers':
@@ -617,7 +759,7 @@ class VKBot:
                 return
             try:
                 promo_id = int(args[0])
-                self.admin_delete_promo(user_id, promo_id)
+                self.start_delete_promo(user_id, promo_id)
             except ValueError:
                 self.send_message(user_id, "ID акции должен быть числом.")
         elif cmd == '/send_promo':
@@ -626,7 +768,7 @@ class VKBot:
                 return
             try:
                 promo_id = int(args[0])
-                self.admin_send_promo_manual(user_id, promo_id)
+                self.start_manual_send(user_id, promo_id)
             except ValueError:
                 self.send_message(user_id, "ID акции должен быть числом.")
         elif cmd == '/set_mailing_time':
@@ -646,25 +788,130 @@ class VKBot:
         elif cmd == '/enable':
             self.admin_enable(user_id)
         else:
-            self.send_message(user_id, "Неизвестная команда. Введите /help для списка команд.")
+            # Если команда не распознана, возможно это нажатие на кнопку админ-панели
+            self.handle_admin_button(user_id, text)
 
-    def send_admin_help(self, user_id):
-        help_text = (
-            "🔧 **Команды администратора**\n"
-            "/stats - статистика пользователей\n"
-            "/answers [дата] - ответы пользователей (можно указать дату ГГГГ-ММ-ДД)\n"
-            "/export - экспорт данных в CSV\n"
-            "/add_promo - добавить акцию\n"
-            "/list_promo - список акций\n"
-            "/edit_promo <id> - редактировать акцию\n"
-            "/delete_promo <id> - удалить акцию\n"
-            "/send_promo <id> - ручная рассылка акции\n"
-            "/set_mailing_time <HH:MM> - установить время рассылки\n"
-            "/reply <vk_id> <текст> - ответить пользователю\n"
-            "/disable - временно отключить бота\n"
-            "/enable - включить бота"
+    def handle_admin_button(self, user_id, button_text):
+        """Обрабатывает нажатия на кнопки админ-панели."""
+        if button_text == '📊 Статистика':
+            self.admin_stats(user_id)
+        elif button_text == '📋 Ответы':
+            self.admin_answers(user_id, [])
+        elif button_text == '📤 Экспорт данных':
+            self.admin_export(user_id)
+        elif button_text == '➕ Добавить акцию':
+            self.start_add_promo(user_id)
+        elif button_text == '📋 Список акций':
+            self.admin_list_promos(user_id)
+        elif button_text == '✏️ Редактировать акцию':
+            self.send_message(user_id, "Введите ID акции для редактирования:")
+            self.admin_states[user_id] = {'action': 'edit_promo_input_id', 'step': 0}
+        elif button_text == '❌ Удалить акцию':
+            self.send_message(user_id, "Введите ID акции для удаления:")
+            self.admin_states[user_id] = {'action': 'delete_promo_input_id', 'step': 0}
+        elif button_text == '📨 Разослать акцию':
+            self.send_message(user_id, "Введите ID акции для ручной рассылки:")
+            self.admin_states[user_id] = {'action': 'manual_send_input_id', 'step': 0}
+        elif button_text == '⏰ Установить время':
+            self.send_message(user_id, "Введите новое время рассылки в формате HH:MM (например, 10:00):")
+            self.admin_states[user_id] = {'action': 'set_mailing_time_input', 'step': 0}
+        elif button_text == '💬 Ответить пользователю':
+            self.send_message(user_id, "Введите ID пользователя VK и текст сообщения через пробел (например, 123456789 Привет!):")
+            self.admin_states[user_id] = {'action': 'reply_input', 'step': 0}
+        elif button_text == '🚫 Отключить бота':
+            self.admin_disable(user_id)
+        elif button_text == '✅ Включить бота':
+            self.admin_enable(user_id)
+        elif button_text == '🔙 Главное меню':
+            self.send_main_menu(user_id)
+        else:
+            self.show_admin_panel(user_id)  # если что-то пошло не так, покажем панель
+
+    def handle_admin_state_input(self, event):
+        """Обрабатывает многошаговые вводы администратора (добавление, редактирование и т.д.)."""
+        user_id = event.message['from_id']
+        text = event.message['text'].strip()
+        state = self.admin_states.get(user_id)
+        if not state:
+            return
+
+        action = state['action']
+
+        if action == 'add_promo':
+            self.handle_add_promo_input(user_id, text, state)
+        elif action == 'edit_promo':
+            self.handle_edit_promo_input(user_id, text, state)
+        elif action == 'edit_promo_input_id':
+            try:
+                promo_id = int(text)
+                self.start_edit_promo(user_id, promo_id)
+            except ValueError:
+                self.send_message(user_id, "ID должен быть числом. Попробуйте снова.")
+                del self.admin_states[user_id]
+                self.show_admin_panel(user_id)
+        elif action == 'delete_promo_input_id':
+            try:
+                promo_id = int(text)
+                self.start_delete_promo(user_id, promo_id)
+            except ValueError:
+                self.send_message(user_id, "ID должен быть числом. Попробуйте снова.")
+                del self.admin_states[user_id]
+                self.show_admin_panel(user_id)
+        elif action == 'manual_send_input_id':
+            try:
+                promo_id = int(text)
+                self.start_manual_send(user_id, promo_id)
+            except ValueError:
+                self.send_message(user_id, "ID должен быть числом. Попробуйте снова.")
+                del self.admin_states[user_id]
+                self.show_admin_panel(user_id)
+        elif action == 'set_mailing_time_input':
+            self.admin_set_mailing_time(user_id, text)
+            del self.admin_states[user_id]
+            self.show_admin_panel(user_id)
+        elif action == 'reply_input':
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2:
+                self.send_message(user_id, "Нужно указать ID и текст. Пример: 123456789 Привет!")
+                return
+            target_id, reply_text = parts[0], parts[1]
+            self.admin_reply(user_id, target_id, reply_text)
+            del self.admin_states[user_id]
+            self.show_admin_panel(user_id)
+        else:
+            logger.warning(f"Неизвестное действие админа {action}")
+            del self.admin_states[user_id]
+            self.show_admin_panel(user_id)
+
+    def show_admin_panel(self, user_id):
+        """Показывает админ-панель с клавиатурой."""
+        msg = (
+            "🔧 **АДМИНИСТРИРОВАНИЕ**\n"
+            "══════════════════════════════\n"
+            "👤 **Пользовательские функции**\n"
+            "(доступны также обычным пользователям)\n"
+            "────────────────────────\n"
+            "📢 Акции\n"
+            "📝 Отправить заявку\n"
+            "❓ Пройти опрос\n\n"
+            "⚙️ **Управление ботом**\n"
+            "────────────────────────\n"
+            "📊 Статистика\n"
+            "📋 Ответы\n"
+            "📤 Экспорт данных\n"
+            "➕ Добавить акцию\n"
+            "📋 Список акций\n"
+            "✏️ Редактировать акцию\n"
+            "❌ Удалить акцию\n"
+            "📨 Разослать акцию вручную\n"
+            "⏰ Установить время рассылки\n"
+            "💬 Ответить пользователю\n"
+            "🚫 Отключить бота\n"
+            "✅ Включить бота\n\n"
+            "Используйте кнопки ниже для выбора действия."
         )
-        self.send_message(user_id, help_text)
+        kb = get_admin_keyboard()
+        self.send_message(user_id, msg, kb)
 
     def admin_stats(self, user_id):
         conn = get_db_connection()
@@ -682,10 +929,11 @@ class VKBot:
                f"Подписаны на акции: {subscribed}")
         self.send_message(user_id, msg)
         log_admin_action(user_id, 'stats', msg)
+        self.show_admin_panel(user_id)
 
     def admin_answers(self, user_id, args):
         date_filter = None
-        if args:
+        if args and args[0]:
             date_filter = args[0]
         conn = get_db_connection()
         cur = conn.cursor()
@@ -709,17 +957,18 @@ class VKBot:
         conn.close()
         if not rows:
             self.send_message(user_id, "Нет ответов за указанный период.")
-            return
-        msg_lines = ["📝 **Ответы пользователей**:"]
-        for row in rows:
-            line = (f"[{row['answered_at']}] {row['first_name']} {row['last_name']} (id{row['vk_id']}):\n"
-                    f"  {row['question']} → {row['answer']}")
-            msg_lines.append(line)
-        chunk_size = 5
-        for i in range(0, len(msg_lines), chunk_size):
-            chunk = '\n\n'.join(msg_lines[i:i+chunk_size])
-            self.send_message(user_id, chunk)
+        else:
+            msg_lines = ["📝 **Ответы пользователей**:"]
+            for row in rows:
+                line = (f"[{row['answered_at']}] {row['first_name']} {row['last_name']} (id{row['vk_id']}):\n"
+                        f"  {row['question']} → {row['answer']}")
+                msg_lines.append(line)
+            chunk_size = 5
+            for i in range(0, len(msg_lines), chunk_size):
+                chunk = '\n\n'.join(msg_lines[i:i+chunk_size])
+                self.send_message(user_id, chunk)
         log_admin_action(user_id, 'answers', f"date={date_filter if date_filter else 'all'}")
+        self.show_admin_panel(user_id)
 
     def admin_export(self, user_id):
         conn = get_db_connection()
@@ -735,9 +984,11 @@ class VKBot:
         conn.close()
         if not rows:
             self.send_message(user_id, "Нет данных для экспорта.")
+            self.show_admin_panel(user_id)
             return
+
         output = io.StringIO()
-        writer = csv.writer(output)
+        writer = csv.writer(output, delimiter=',', quoting=csv.QUOTE_MINIMAL)
         writer.writerow(['vk_id', 'first_name', 'last_name', 'first_seen', 'last_interaction', 'subscribed',
                          'question', 'answer', 'answered_at'])
         for row in rows:
@@ -746,47 +997,26 @@ class VKBot:
                              row['answered_at']])
         csv_data = output.getvalue().encode('utf-8-sig')
         output.close()
-        self.upload_and_send_document(user_id, csv_data, 'survey_export.csv')
-        log_admin_action(user_id, 'export', 'CSV exported')
 
-    def upload_and_send_document(self, user_id, file_data, filename):
+        # Загрузка документа через VkUpload
         try:
-            upload_server = self.vk.docs.getMessagesUploadServer(type='doc', peer_id=user_id)['upload_url']
-            with io.BytesIO(file_data) as f:
-                response = vk_api.uploader.upload(upload_server, {'file': (filename, f)})
-            doc = self.vk.docs.save(file=response['file'], title=filename)['doc']
-            attachment = f"doc{doc['owner_id']}_{doc['id']}"
+            doc = self.upload.document_message(
+                peer_id=user_id,
+                file=io.BytesIO(csv_data),
+                title='survey_export.csv'
+            )
+            attachment = f"doc{doc['doc']['owner_id']}_{doc['doc']['id']}"
             self.send_message(user_id, "Файл с данными:", attachment=attachment)
+            log_admin_action(user_id, 'export', 'CSV exported')
         except Exception as e:
             logger.error(f"Ошибка загрузки документа: {e}")
-            self.send_message(user_id, "Не удалось загрузить файл. Ошибка: " + str(e))
+            self.send_message(user_id, f"Не удалось загрузить файл. Ошибка: {e}")
+        self.show_admin_panel(user_id)
 
     # ---------- Управление акциями (админ) ----------
     def start_add_promo(self, user_id):
         self.admin_states[user_id] = {'action': 'add_promo', 'step': 1, 'data': {}}
         self.send_message(user_id, "Введите **название** акции:")
-
-    def start_edit_promo(self, user_id, promo_id):
-        promo = get_promotion(promo_id)
-        if not promo:
-            self.send_message(user_id, f"Акция с ID {promo_id} не найдена.")
-            return
-        self.admin_states[user_id] = {'action': 'edit_promo', 'step': 1, 'data': promo, 'promo_id': promo_id}
-        self.send_message(user_id, f"Редактирование акции ID {promo_id}\n"
-                                   f"Текущее название: {promo['title']}\n"
-                                   "Введите новое название (или отправьте 'пропустить'):")
-
-    def handle_admin_state_input(self, event):
-        user_id = event.message['from_id']
-        text = event.message['text'].strip()
-        state = self.admin_states.get(user_id)
-        if not state:
-            return
-
-        if state['action'] == 'add_promo':
-            self.handle_add_promo_input(user_id, text, state)
-        elif state['action'] == 'edit_promo':
-            self.handle_edit_promo_input(user_id, text, state)
 
     def handle_add_promo_input(self, user_id, text, state):
         step = state['step']
@@ -827,6 +1057,18 @@ class VKBot:
             self.send_message(user_id, f"✅ Акция успешно добавлена! ID: {promo_id}")
             log_admin_action(user_id, 'add_promo', f"promo_id={promo_id}, title={data['title']}")
             del self.admin_states[user_id]
+            self.show_admin_panel(user_id)
+
+    def start_edit_promo(self, user_id, promo_id):
+        promo = get_promotion(promo_id)
+        if not promo:
+            self.send_message(user_id, f"Акция с ID {promo_id} не найдена.")
+            self.show_admin_panel(user_id)
+            return
+        self.admin_states[user_id] = {'action': 'edit_promo', 'step': 1, 'data': promo, 'promo_id': promo_id}
+        self.send_message(user_id, f"Редактирование акции ID {promo_id}\n"
+                                   f"Текущее название: {promo['title']}\n"
+                                   "Введите новое название (или отправьте 'пропустить'):")
 
     def handle_edit_promo_input(self, user_id, text, state):
         step = state['step']
@@ -874,39 +1116,29 @@ class VKBot:
             self.send_message(user_id, f"✅ Акция ID {promo_id} успешно отредактирована.")
             log_admin_action(user_id, 'edit_promo', f"promo_id={promo_id}")
             del self.admin_states[user_id]
+            self.show_admin_panel(user_id)
 
-    def admin_list_promos(self, user_id):
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute('SELECT id, title, start_date, end_date, is_active, periodicity FROM promotions ORDER BY created_at DESC')
-        rows = cur.fetchall()
-        conn.close()
-        if not rows:
-            self.send_message(user_id, "Нет акций.")
-            return
-        msg_lines = ["📋 **Список акций**:"]
-        for row in rows:
-            status = "🟢 активна" if row['is_active'] else "🔴 неактивна"
-            msg_lines.append(f"ID {row['id']}: {row['title']} ({row['start_date']} - {row['end_date']}) - {status}, период: {row['periodicity']}")
-        self.send_message(user_id, '\n'.join(msg_lines))
-
-    def admin_delete_promo(self, user_id, promo_id):
+    def start_delete_promo(self, user_id, promo_id):
         promo = get_promotion(promo_id)
         if not promo:
             self.send_message(user_id, f"Акция с ID {promo_id} не найдена.")
+            self.show_admin_panel(user_id)
             return
         delete_promotion(promo_id)
         self.send_message(user_id, f"✅ Акция ID {promo_id} удалена.")
         log_admin_action(user_id, 'delete_promo', f"promo_id={promo_id}")
+        self.show_admin_panel(user_id)
 
-    def admin_send_promo_manual(self, user_id, promo_id):
+    def start_manual_send(self, user_id, promo_id):
         promo = get_promotion(promo_id)
         if not promo:
             self.send_message(user_id, f"Акция с ID {promo_id} не найдена.")
+            self.show_admin_panel(user_id)
             return
         subscribers = get_subscribers()
         if not subscribers:
             self.send_message(user_id, "Нет подписчиков для рассылки.")
+            self.show_admin_panel(user_id)
             return
         sent_count = 0
         for sub in subscribers:
@@ -922,6 +1154,20 @@ class VKBot:
         update_promotion(promo_id, last_sent=datetime.now().isoformat())
         self.send_message(user_id, f"✅ Рассылка завершена. Отправлено {sent_count} подписчикам.")
         log_admin_action(user_id, 'manual_send', f"promo_id={promo_id}, sent={sent_count}")
+        self.show_admin_panel(user_id)
+
+    def admin_list_promos(self, user_id):
+        promos = get_all_promotions()
+        if not promos:
+            self.send_message(user_id, "Нет акций.")
+        else:
+            msg_lines = ["📋 **Список акций**:"]
+            for p in promos:
+                status = "🟢 активна" if p['is_active'] else "🔴 неактивна"
+                msg_lines.append(f"ID {p['id']}: {p['title']} ({p['start_date']} - {p['end_date']}) - {status}, период: {p['periodicity']}")
+            self.send_message(user_id, '\n'.join(msg_lines))
+        log_admin_action(user_id, 'list_promo')
+        self.show_admin_panel(user_id)
 
     def admin_set_mailing_time(self, user_id, time_str):
         try:
@@ -932,11 +1178,12 @@ class VKBot:
             log_admin_action(user_id, 'set_mailing_time', time_str)
         except ValueError:
             self.send_message(user_id, "Неверный формат времени. Используйте HH:MM (например, 10:00)")
+        self.show_admin_panel(user_id)
 
     def admin_reply(self, admin_id, target_vk_id, text):
         try:
             target_vk_id = int(target_vk_id)
-            self.send_message(target_vk_id, f"📨 Сообщение от администратора:\n{text}")
+            self.send_message(target_vk_id, f"📨 **Сообщение от администратора:**\n{text}")
             self.send_message(admin_id, f"✅ Сообщение отправлено пользователю {target_vk_id}")
             log_admin_action(admin_id, 'reply', f"to={target_vk_id}, text={text[:50]}...")
         except ValueError:
@@ -947,14 +1194,16 @@ class VKBot:
     def admin_disable(self, user_id):
         self.enabled = False
         self.disabled_until = None
-        self.send_message(user_id, "🚫 Бот отключен. Для включения используйте /enable")
+        self.send_message(user_id, "🚫 Бот отключен. Для включения используйте /enable или кнопку '✅ Включить бота'.")
         log_admin_action(user_id, 'disable')
+        self.show_admin_panel(user_id)
 
     def admin_enable(self, user_id):
         self.enabled = True
         self.disabled_until = None
         self.send_message(user_id, "✅ Бот включен.")
         log_admin_action(user_id, 'enable')
+        self.show_admin_panel(user_id)
 
     # ============= АВТОМАТИЧЕСКАЯ РАССЫЛКА ===================================
     def mailing_worker(self):
