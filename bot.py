@@ -3,7 +3,7 @@
 
 """
 ВКонтакте бот для сбора потребностей в услугах по продвижению сайтов.
-Версия 1.2 (с проверкой наличия vk_api)
+Версия 1.4 (конфигурация через переменные окружения: GROUP_ID, API_TOKEN, ADMIN_IDS)
 """
 
 import os
@@ -15,7 +15,6 @@ import time
 import csv
 import io
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
 
 # Проверка наличия обязательной библиотеки vk_api
 try:
@@ -30,35 +29,7 @@ except ImportError:
     print("="*60)
     sys.exit(1)
 
-# ================== КОНФИГУРАЦИЯ (переменные окружения) ==================
-# Обязательные переменные
-VK_GROUP_ID = os.getenv('VK_GROUP_ID')
-VK_API_TOKEN = os.getenv('VK_API_TOKEN')
-admin_ids_str = os.getenv('ADMIN_IDS', '')
-
-if not VK_GROUP_ID or not VK_API_TOKEN:
-    raise ValueError("Не заданы обязательные переменные окружения VK_GROUP_ID и/или VK_API_TOKEN")
-
-# Преобразуем строку с ID администраторов в список целых чисел
-ADMIN_IDS = []
-if admin_ids_str.strip():
-    for part in admin_ids_str.split(','):
-        part = part.strip()
-        if part.isdigit():
-            ADMIN_IDS.append(int(part))
-        else:
-            logging.warning(f"Некорректный ID администратора пропущен: {part}")
-
-# Остальные настройки (можно менять через переменные окружения при необходимости)
-DB_FILE = os.getenv('DB_FILE', 'bot_database.db')
-DEFAULT_MAILING_TIME = os.getenv('DEFAULT_MAILING_TIME', '10:00')
-MAILING_CHECK_INTERVAL = int(os.getenv('MAILING_CHECK_INTERVAL', '60'))
-
-# Флаг для отключения бота (команда /disable)
-BOT_ENABLED = True
-BOT_DISABLED_UNTIL = None
-
-# Настройка логирования
+# ================== НАСТРОЙКА ЛОГИРОВАНИЯ ==================================
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -68,6 +39,54 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger('VK_bot')
+# ===========================================================================
+
+# ================== КОНФИГУРАЦИЯ (переменные окружения) ====================
+# Значения по умолчанию (замените на свои для локального запуска)
+DEFAULT_GROUP_ID = "123456789"                 # ID группы ВКонтакте
+DEFAULT_API_TOKEN = "vk1.a.xxxxxxxxxxxx"       # Токен доступа сообщества
+DEFAULT_ADMIN_IDS = [123456, 789012]           # ID администраторов
+
+# Получение значений из переменных окружения
+GROUP_ID = os.getenv('GROUP_ID')
+API_TOKEN = os.getenv('API_TOKEN')
+admin_ids_str = os.getenv('ADMIN_IDS', '')
+
+# Если переменные окружения не заданы, используем значения по умолчанию
+if not GROUP_ID:
+    GROUP_ID = DEFAULT_GROUP_ID
+    logger.warning("GROUP_ID не задан в окружении, используется значение по умолчанию. Установите переменную окружения для продакшена.")
+
+if not API_TOKEN:
+    API_TOKEN = DEFAULT_API_TOKEN
+    logger.warning("API_TOKEN не задан в окружении, используется значение по умолчанию. Установите переменную окружения для продакшена.")
+
+if admin_ids_str.strip():
+    ADMIN_IDS = [int(id.strip()) for id in admin_ids_str.split(',') if id.strip().isdigit()]
+else:
+    ADMIN_IDS = DEFAULT_ADMIN_IDS
+    logger.warning("ADMIN_IDS не задан в окружении, используется список по умолчанию.")
+
+# Проверка, что значения по умолчанию заменены (не остались заглушками)
+if GROUP_ID == "123456789":
+    logger.error("GROUP_ID имеет значение-заглушку. Пожалуйста, замените его на реальный ID группы в переменных окружения или в DEFAULT_GROUP_ID.")
+    sys.exit(1)
+
+if API_TOKEN == "vk1.a.xxxxxxxxxxxx":
+    logger.error("API_TOKEN имеет значение-заглушку. Пожалуйста, замените его на реальный токен в переменных окружения или в DEFAULT_API_TOKEN.")
+    sys.exit(1)
+
+if ADMIN_IDS == [123456, 789012]:
+    logger.warning("ADMIN_IDS имеет значение-заглушку. Если не заменить, административный функционал будет недоступен.")
+
+# Остальные настройки (можно менять через переменные окружения при необходимости)
+DB_FILE = os.getenv('DB_FILE', 'bot_database.db')
+DEFAULT_MAILING_TIME = os.getenv('DEFAULT_MAILING_TIME', '10:00')
+MAILING_CHECK_INTERVAL = int(os.getenv('MAILING_CHECK_INTERVAL', '60'))
+
+# Флаг для отключения бота (команда /disable)
+BOT_ENABLED = True
+BOT_DISABLED_UNTIL = None
 # ===========================================================================
 
 # ================== РАБОТА С БАЗОЙ ДАННЫХ ==================================
@@ -976,7 +995,7 @@ class VKBot:
 # ================== ЗАПУСК БОТА ===========================================
 def main():
     init_db()
-    bot = VKBot(VK_GROUP_ID, VK_API_TOKEN)
+    bot = VKBot(GROUP_ID, API_TOKEN)
 
     mailing_thread = threading.Thread(target=bot.mailing_worker, daemon=True)
     mailing_thread.start()
