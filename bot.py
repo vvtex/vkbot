@@ -3,7 +3,7 @@
 
 """
 ВКонтакте бот для сбора потребностей в услугах по продвижению сайтов.
-Версия 3.5 (исправлен KeyError при сборе заявки)
+Версия 3.6 (тайм-аут 10 минут, улучшенные уведомления)
 """
 
 import os
@@ -97,6 +97,7 @@ MAILING_CHECK_INTERVAL = int(os.getenv('MAILING_CHECK_INTERVAL', '60'))
 
 BOT_ENABLED = True
 BOT_DISABLED_UNTIL = None
+TIMEOUT_MINUTES = 10  # тайм-аут неактивности пользователя (в минутах)
 # ===========================================================================
 
 # ================== РАБОТА С БАЗОЙ ДАННЫХ ==================================
@@ -478,6 +479,22 @@ class VKBot:
             return True
         return False
 
+    def check_timeout_and_reset(self, user_id, user):
+        """Проверяет, не истек ли тайм-аут неактивности, и сбрасывает состояние при необходимости."""
+        if not user['current_state']:
+            return False
+        last_interaction = datetime.strptime(user['last_interaction'], '%Y-%m-%d %H:%M:%S')
+        if datetime.now() - last_interaction > timedelta(minutes=TIMEOUT_MINUTES):
+            logger.info(f"Тайм-аут для пользователя {user_id}, сбрасываем состояние.")
+            # Очищаем временные данные
+            if user_id in self.user_temp_data:
+                del self.user_temp_data[user_id]
+            clear_user_state(user_id)
+            self.send_message(user_id, "⏳ Время ожидания истекло. Возвращаю в главное меню.")
+            self.send_main_menu(user_id)
+            return True
+        return False
+
     def handle_event(self, event):
         """Обработка события с гарантированным перехватом всех исключений."""
         try:
@@ -500,6 +517,11 @@ class VKBot:
         first_name = event.message.get('first_name', '')
         last_name = event.message.get('last_name', '')
         user = get_or_create_user(user_id, first_name, last_name)
+
+        # Проверка тайм-аута: если пользователь в состоянии и прошло больше TIMEOUT_MINUTES, сбрасываем
+        if self.check_timeout_and_reset(user_id, user):
+            # После сброса выходим, так как пользователь уже получил меню и его состояние очищено
+            return
 
         # Уведомление админов о новом сообщении от пользователя (кроме команд)
         if not is_admin(user_id) and not text.startswith('/'):
@@ -693,20 +715,33 @@ class VKBot:
             subscribed = (text == 'Да')
             set_subscription(user_id, subscribed)
 
-            # Отправляем администраторам результаты опроса
+            # Отправляем администраторам результаты опроса в улучшенном формате
             conn = get_db_connection()
             cur = conn.cursor()
             cur.execute('''
-                SELECT question, answer, answered_at FROM survey_answers
+                SELECT question, answer FROM survey_answers
                 WHERE user_id = ? ORDER BY answered_at
             ''', (user['id'],))
             answers_rows = cur.fetchall()
             conn.close()
+
             if answers_rows:
-                answers_text = '\n'.join([f"{row['question']}: {row['answer']}" for row in answers_rows])
-                admin_msg = (f"📝 **Новый опрос пройден**\n"
-                             f"Пользователь: {user['first_name']} {user['last_name']} (id{user_id})\n"
-                             f"Ответы:\n{answers_text}")
+                # Словарь для сопоставления вопросов с эмодзи
+                emoji_map = {
+                    'Есть ли у вас сайт?': '🌐',
+                    'Нужно ли провести аудит сайта?': '🔍',
+                    'Требуется ли переделать контент?': '📝',
+                    'Вам нужна реклама или только аудит?': '📊'
+                }
+                answers_text = '\n'.join([
+                    f"{emoji_map.get(row['question'], '•')} {row['question']}: {row['answer']}"
+                    for row in answers_rows
+                ])
+                admin_msg = (
+                    f"📝 **Новый опрос пройден**\n"
+                    f"👤 Пользователь: {user['first_name']} {user['last_name']} (id{user_id})\n"
+                    f"📋 **Ответы:**\n{answers_text}"
+                )
                 self.notify_admins(admin_msg)
 
             clear_user_state(user_id)
