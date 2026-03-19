@@ -3,7 +3,7 @@
 
 """
 ВКонтакте бот для сбора потребностей в услугах по продвижению сайтов.
-Версия 2.2 (исправление: преобразование GROUP_ID из формата clubxxxxx в число)
+Версия 2.4 (исправлена обработка кнопок «Начать» / «Не сейчас»)
 """
 
 import os
@@ -416,7 +416,19 @@ class VKBot:
         self.group_id = group_id
         self.token = token
         self.vk_session = vk_api.VkApi(token=token)
-        self.longpoll = VkBotLongPoll(self.vk_session, group_id)
+        try:
+            self.longpoll = VkBotLongPoll(self.vk_session, group_id)
+        except vk_api.exceptions.ApiError as e:
+            if "longpoll for this group is not enabled" in str(e):
+                logger.error(
+                    "Ошибка: Long Poll API не включён для этого сообщества.\n"
+                    "Включите его в настройках сообщества:\n"
+                    "Управление -> Работа с API -> Long Poll API (включить)."
+                )
+            else:
+                logger.error(f"Ошибка при инициализации LongPoll: {e}")
+            sys.exit(1)
+
         self.vk = self.vk_session.get_api()
         self.enabled = BOT_ENABLED
         self.disabled_until = BOT_DISABLED_UNTIL
@@ -477,7 +489,13 @@ class VKBot:
             return
 
         # Обычное сообщение (не команда и не в опросе)
-        self.send_welcome(user_id)
+        # Проверяем, не нажал ли пользователь кнопки "Начать" или "Не сейчас"
+        if text == 'Начать':
+            self.start_survey(user_id)
+        elif text == 'Не сейчас':
+            self.send_message(user_id, "Хорошо, если захотите пройти опрос, просто напишите мне.", get_empty_keyboard())
+        else:
+            self.send_welcome(user_id)
 
     def send_welcome(self, user_id):
         """Отправляет приветственное сообщение с предложением опроса."""
