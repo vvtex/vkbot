@@ -3,7 +3,7 @@
 
 """
 ВКонтакте бот для сбора потребностей в услугах по продвижению сайтов.
-Версия 3.4 (улучшена обработка ошибок в handle_event)
+Версия 3.5 (исправлен KeyError при сборе заявки)
 """
 
 import os
@@ -585,17 +585,33 @@ class VKBot:
         state = user['current_state']
         text = event.message['text'].strip()
 
+        # Если временные данные отсутствуют (например, после перезапуска бота) - инициализируем
+        if user_id not in self.user_temp_data:
+            self.user_temp_data[user_id] = {}
+
         if state == 'request_name':
             self.user_temp_data[user_id]['name'] = text
             update_user_state(user_id, 'request_phone')
             self.send_message(user_id, "📞 Введите ваш контактный телефон:", get_empty_keyboard())
 
         elif state == 'request_phone':
+            # Проверяем, что имя уже сохранено, иначе начинаем заново
+            if 'name' not in self.user_temp_data[user_id]:
+                logger.warning(f"Для пользователя {user_id} отсутствует имя в состоянии request_phone. Сброс.")
+                clear_user_state(user_id)
+                self.start_request(user_id)
+                return
             self.user_temp_data[user_id]['phone'] = text
             update_user_state(user_id, 'request_email')
             self.send_message(user_id, "📧 Введите ваш email:", get_empty_keyboard())
 
         elif state == 'request_email':
+            # Проверяем наличие всех предыдущих данных
+            if 'name' not in self.user_temp_data[user_id] or 'phone' not in self.user_temp_data[user_id]:
+                logger.warning(f"Для пользователя {user_id} отсутствуют имя или телефон в состоянии request_email. Сброс.")
+                clear_user_state(user_id)
+                self.start_request(user_id)
+                return
             self.user_temp_data[user_id]['email'] = text
             data = self.user_temp_data.pop(user_id, {})
             name = data.get('name', '')
