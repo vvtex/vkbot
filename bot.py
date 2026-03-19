@@ -677,7 +677,8 @@ class VKBot:
             self.handle_admin_state_input(event)
             return
 
-        if cmd == '/admin' or cmd == '/start' or cmd == '/help':
+        # Команды для входа в админ-панель (добавлена /adminka)
+        if cmd in ('/admin', '/adminka', '/start', '/help'):
             self.show_admin_panel(user_id)
         elif cmd == '/stats':
             self.admin_stats(user_id)
