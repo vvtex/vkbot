@@ -3,7 +3,7 @@
 
 """
 ВКонтакте бот для сбора потребностей в услугах по продвижению сайтов.
-Версия 3.2 (добавлены уведомления админам о сообщениях и опросах)
+Версия 3.3 (исправлена обработка ошибок отправки сообщений)
 """
 
 import os
@@ -14,6 +14,7 @@ import threading
 import time
 import csv
 import io
+import traceback
 from datetime import datetime, timedelta
 
 try:
@@ -22,6 +23,7 @@ try:
     from vk_api.keyboard import VkKeyboard, VkKeyboardColor
     from vk_api.utils import get_random_id
     from vk_api import VkUpload
+    from vk_api.exceptions import ApiError
 except ImportError:
     print("="*60)
     print("ОШИБКА: не установлена библиотека vk_api.")
@@ -442,6 +444,7 @@ class VKBot:
         self.user_temp_data = {}     # временные данные для заявок (имя, телефон, email)
 
     def send_message(self, user_id, message, keyboard=None, attachment=None):
+        """Отправка сообщения с обработкой ошибок доставки."""
         try:
             self.vk.messages.send(
                 user_id=user_id,
@@ -450,13 +453,23 @@ class VKBot:
                 keyboard=keyboard,
                 attachment=attachment
             )
-        except vk_api.exceptions.ApiError as e:
-            logger.error(f"Ошибка отправки сообщения пользователю {user_id}: {e}")
+        except ApiError as e:
+            # Код 901: нельзя отправить сообщение пользователю (например, заблокировал бота)
+            # Код 404406378: доступ запрещён (пользователь запретил сообщения от сообщества)
+            if e.code in [901, 404406378]:
+                logger.warning(f"Не удалось отправить сообщение пользователю {user_id}: {e} (код {e.code})")
+            else:
+                logger.error(f"Ошибка VK API при отправке сообщения пользователю {user_id}: {e}")
+        except Exception as e:
+            logger.error(f"Неизвестная ошибка при отправке сообщения пользователю {user_id}: {e}")
 
     def notify_admins(self, message, attachment=None):
-        """Отправить уведомление всем администраторам."""
+        """Отправить уведомление всем администраторам с обработкой ошибок."""
         for admin_id in ADMIN_IDS:
-            self.send_message(admin_id, message, attachment=attachment)
+            try:
+                self.send_message(admin_id, message, attachment=attachment)
+            except Exception as e:
+                logger.error(f"Не удалось уведомить администратора {admin_id}: {e}")
 
     def is_bot_disabled(self):
         if not self.enabled:
@@ -1243,6 +1256,7 @@ def main():
                 bot.handle_event(event)
         except Exception as e:
             logger.error(f"Ошибка в основном цикле: {e}")
+            logger.error(traceback.format_exc())  # Добавлен трейсбек для диагностики
             time.sleep(5)
 
 if __name__ == '__main__':
