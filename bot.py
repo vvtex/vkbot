@@ -3,7 +3,7 @@
 
 """
 ВКонтакте бот для сбора потребностей в услугах по продвижению сайтов.
-Версия 1.4 (конфигурация через переменные окружения: GROUP_ID, API_TOKEN, ADMIN_IDS)
+Версия 2.0 (конфигурация строго через системные переменные: GROUP_ID, API_TOKEN, ADMIN_IDS)
 """
 
 import os
@@ -41,43 +41,36 @@ logging.basicConfig(
 logger = logging.getLogger('VK_bot')
 # ===========================================================================
 
-# ================== КОНФИГУРАЦИЯ (переменные окружения) ====================
-# Значения по умолчанию (замените на свои для локального запуска)
-DEFAULT_GROUP_ID = "123456789"                 # ID группы ВКонтакте
-DEFAULT_API_TOKEN = "vk1.a.xxxxxxxxxxxx"       # Токен доступа сообщества
-DEFAULT_ADMIN_IDS = [123456, 789012]           # ID администраторов
-
-# Получение значений из переменных окружения
+# ================== КОНФИГУРАЦИЯ (строго из переменных окружения) ===========
 GROUP_ID = os.getenv('GROUP_ID')
 API_TOKEN = os.getenv('API_TOKEN')
-admin_ids_str = os.getenv('ADMIN_IDS', '')
+admin_ids_str = os.getenv('ADMIN_IDS')
 
-# Если переменные окружения не заданы, используем значения по умолчанию
+# Проверка обязательных переменных
 if not GROUP_ID:
-    GROUP_ID = DEFAULT_GROUP_ID
-    logger.warning("GROUP_ID не задан в окружении, используется значение по умолчанию. Установите переменную окружения для продакшена.")
+    logger.error("Переменная окружения GROUP_ID не задана.")
+    sys.exit(1)
 
 if not API_TOKEN:
-    API_TOKEN = DEFAULT_API_TOKEN
-    logger.warning("API_TOKEN не задан в окружении, используется значение по умолчанию. Установите переменную окружения для продакшена.")
-
-if admin_ids_str.strip():
-    ADMIN_IDS = [int(id.strip()) for id in admin_ids_str.split(',') if id.strip().isdigit()]
-else:
-    ADMIN_IDS = DEFAULT_ADMIN_IDS
-    logger.warning("ADMIN_IDS не задан в окружении, используется список по умолчанию.")
-
-# Проверка, что значения по умолчанию заменены (не остались заглушками)
-if GROUP_ID == "123456789":
-    logger.error("GROUP_ID имеет значение-заглушку. Пожалуйста, замените его на реальный ID группы в переменных окружения или в DEFAULT_GROUP_ID.")
+    logger.error("Переменная окружения API_TOKEN не задана.")
     sys.exit(1)
 
-if API_TOKEN == "vk1.a.xxxxxxxxxxxx":
-    logger.error("API_TOKEN имеет значение-заглушку. Пожалуйста, замените его на реальный токен в переменных окружения или в DEFAULT_API_TOKEN.")
+if not admin_ids_str:
+    logger.error("Переменная окружения ADMIN_IDS не задана.")
     sys.exit(1)
 
-if ADMIN_IDS == [123456, 789012]:
-    logger.warning("ADMIN_IDS имеет значение-заглушку. Если не заменить, административный функционал будет недоступен.")
+# Парсим список администраторов
+ADMIN_IDS = []
+for part in admin_ids_str.split(','):
+    part = part.strip()
+    if part.isdigit():
+        ADMIN_IDS.append(int(part))
+    else:
+        logger.warning(f"Некорректный ID администратора пропущен: {part}")
+
+if not ADMIN_IDS:
+    logger.error("Список ADMIN_IDS пуст или не содержит корректных ID.")
+    sys.exit(1)
 
 # Остальные настройки (можно менять через переменные окружения при необходимости)
 DB_FILE = os.getenv('DB_FILE', 'bot_database.db')
@@ -121,14 +114,6 @@ def init_db():
         )
     ''')
 
-    # Таблица администраторов
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS admins (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            vk_id INTEGER UNIQUE NOT NULL
-        )
-    ''')
-
     # Таблица акций
     cur.execute('''
         CREATE TABLE IF NOT EXISTS promotions (
@@ -166,10 +151,6 @@ def init_db():
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-
-    # Добавляем администраторов из ADMIN_IDS, если их нет
-    for admin_id in ADMIN_IDS:
-        cur.execute('INSERT OR IGNORE INTO admins (vk_id) VALUES (?)', (admin_id,))
 
     conn.commit()
     conn.close()
@@ -238,13 +219,8 @@ def set_subscription(vk_id, subscribed):
     conn.close()
 
 def is_admin(vk_id):
-    """Проверяет, является ли пользователь администратором."""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('SELECT 1 FROM admins WHERE vk_id = ?', (vk_id,))
-    result = cur.fetchone() is not None
-    conn.close()
-    return result
+    """Проверяет, является ли пользователь администратором по списку ADMIN_IDS."""
+    return vk_id in ADMIN_IDS
 
 def log_admin_action(admin_vk_id, action, details=''):
     """Записать действие администратора в лог."""
