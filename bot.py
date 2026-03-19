@@ -3,7 +3,7 @@
 
 """
 ВКонтакте бот для сбора потребностей в услугах по продвижению сайтов.
-Версия 2.0 (конфигурация строго через системные переменные: GROUP_ID, API_TOKEN, ADMIN_IDS)
+Версия 2.1 (конфигурация через системные переменные: GROUP_ID, API_TOKEN, ADMIN_IDS, DATA_DIR)
 """
 
 import os
@@ -30,11 +30,21 @@ except ImportError:
     sys.exit(1)
 
 # ================== НАСТРОЙКА ЛОГИРОВАНИЯ ==================================
+# Используем DATA_DIR для размещения лог-файла
+DATA_DIR = os.getenv('DATA_DIR', '.').rstrip('/')
+if not os.path.exists(DATA_DIR):
+    try:
+        os.makedirs(DATA_DIR)
+    except Exception as e:
+        print(f"Не удалось создать директорию {DATA_DIR}: {e}")
+        sys.exit(1)
+
+log_file = os.path.join(DATA_DIR, 'bot.log')
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('bot.log', encoding='utf-8'),
+        logging.FileHandler(log_file, encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -73,7 +83,7 @@ if not ADMIN_IDS:
     sys.exit(1)
 
 # Остальные настройки (можно менять через переменные окружения при необходимости)
-DB_FILE = os.getenv('DB_FILE', 'bot_database.db')
+DB_FILE = os.getenv('DB_FILE', os.path.join(DATA_DIR, 'bot_database.db'))
 DEFAULT_MAILING_TIME = os.getenv('DEFAULT_MAILING_TIME', '10:00')
 MAILING_CHECK_INTERVAL = int(os.getenv('MAILING_CHECK_INTERVAL', '60'))
 
@@ -154,7 +164,7 @@ def init_db():
 
     conn.commit()
     conn.close()
-    logger.info("База данных инициализирована.")
+    logger.info("База данных инициализирована. Файл: %s", DB_FILE)
 
 def get_db_connection():
     """Возвращает соединение с БД с настроенным row_factory."""
