@@ -3,7 +3,7 @@
 
 """
 ВКонтакте бот для сбора потребностей в услугах по продвижению сайтов.
-Версия 3.3 (исправлена обработка ошибок отправки сообщений)
+Версия 3.4 (улучшена обработка ошибок в handle_event)
 """
 
 import os
@@ -479,15 +479,20 @@ class VKBot:
         return False
 
     def handle_event(self, event):
-        if self.is_bot_disabled():
-            if event.from_user:
-                user_id = event.message['from_id']
-                if is_admin(user_id) and event.message['text'].startswith('/enable'):
-                    self.process_admin_command(event)
-            return
+        """Обработка события с гарантированным перехватом всех исключений."""
+        try:
+            if self.is_bot_disabled():
+                if event.from_user:
+                    user_id = event.message['from_id']
+                    if is_admin(user_id) and event.message['text'].startswith('/enable'):
+                        self.process_admin_command(event)
+                return
 
-        if event.type == VkBotEventType.MESSAGE_NEW and event.from_user:
-            self.handle_message(event)
+            if event.type == VkBotEventType.MESSAGE_NEW and event.from_user:
+                self.handle_message(event)
+        except Exception as e:
+            logger.error(f"Необработанное исключение в handle_event: {e}")
+            logger.error(traceback.format_exc())
 
     def handle_message(self, event):
         user_id = event.message['from_id']
@@ -1203,6 +1208,7 @@ class VKBot:
                     time.sleep(MAILING_CHECK_INTERVAL)
             except Exception as e:
                 logger.error(f"Ошибка в потоке рассылки: {e}")
+                logger.error(traceback.format_exc())
                 time.sleep(60)
 
     def perform_mailing(self):
@@ -1256,7 +1262,7 @@ def main():
                 bot.handle_event(event)
         except Exception as e:
             logger.error(f"Ошибка в основном цикле: {e}")
-            logger.error(traceback.format_exc())  # Добавлен трейсбек для диагностики
+            logger.error(traceback.format_exc())
             time.sleep(5)
 
 if __name__ == '__main__':
