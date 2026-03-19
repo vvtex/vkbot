@@ -6,13 +6,14 @@
 Версия 1.0
 Разработан в соответствии с ТЗ.
 """
-
+import os
 import sqlite3
 import logging
 import threading
 import time
 import csv
 import io
+
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
@@ -22,9 +23,20 @@ from vk_api.keyboard import VkKeyboard, VkKeyboardColor
 from vk_api.utils import get_random_id
 
 # ================== КОНФИГУРАЦИЯ (замените на свои данные) ==================
-VK_GROUP_ID = '123456789'                # ID группы ВК
-VK_API_TOKEN = 'vk1.a.xxxxxxxxxxxx'      # Токен сообщества (ключ доступа)
-ADMIN_IDS = [123456, 789012]              # ID администраторов ВК (можно добавить позже через БД)
+#VK_GROUP_ID = '123456789'                # ID группы ВК
+#VK_API_TOKEN = 'vk1.a.xxxxxxxxxxxx'      # Токен сообщества (ключ доступа)
+#ADMIN_IDS = [123456, 789012]              # ID администраторов ВК (можно добавить позже через БД)
+
+
+
+# ================== КОНФИГУРАЦИЯ (переменные окружения) ==================
+# Получение значений из переменных окружения с запасными значениями по умолчанию
+VK_GROUP_ID = os.getenv('VK_GROUP_ID')           # ID группы ВК
+VK_API_TOKEN = os.getenv('VK_API_TOKEN') # Токен сообщества
+
+# Список администраторов: ожидается строка с ID, разделёнными запятыми, например "123456,789012"
+admin_ids_str = os.getenv('ADMIN_IDS')
+ADMIN_IDS = [int(id.strip()) for id in admin_ids_str.split(',') if id.strip().isdigit()]
 
 # Настройки базы данных
 DB_FILE = 'bot_database.db'
