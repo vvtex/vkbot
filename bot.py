@@ -3,7 +3,7 @@
 
 """
 ВКонтакте бот для сбора потребностей в услугах по продвижению сайтов.
-Версия 3.6 (тайм-аут 10 минут, улучшенные уведомления)
+Версия 3.8 (добавлена кнопка "Назад" в опрос)
 """
 
 import os
@@ -98,6 +98,7 @@ MAILING_CHECK_INTERVAL = int(os.getenv('MAILING_CHECK_INTERVAL', '60'))
 BOT_ENABLED = True
 BOT_DISABLED_UNTIL = None
 TIMEOUT_MINUTES = 10  # тайм-аут неактивности пользователя (в минутах)
+USERS_PER_PAGE = 10   # количество пользователей на странице в списке
 # ===========================================================================
 
 # ================== РАБОТА С БАЗОЙ ДАННЫХ ==================================
@@ -113,9 +114,15 @@ def init_db():
             first_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
             last_interaction DATETIME DEFAULT CURRENT_TIMESTAMP,
             subscribed BOOLEAN DEFAULT 0,
-            current_state TEXT
+            current_state TEXT,
+            is_blocked BOOLEAN DEFAULT 0
         )
     ''')
+    try:
+        cur.execute('ALTER TABLE users ADD COLUMN is_blocked BOOLEAN DEFAULT 0')
+    except sqlite3.OperationalError:
+        pass
+
     cur.execute('''
         CREATE TABLE IF NOT EXISTS survey_answers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -189,8 +196,8 @@ def get_or_create_user(vk_id, first_name='', last_name=''):
         return dict(user)
     else:
         cur.execute('''
-            INSERT INTO users (vk_id, first_name, last_name, first_seen, last_interaction)
-            VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            INSERT INTO users (vk_id, first_name, last_name, first_seen, last_interaction, is_blocked)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 0)
         ''', (vk_id, first_name, last_name))
         conn.commit()
         user_id = cur.lastrowid
@@ -201,7 +208,8 @@ def get_or_create_user(vk_id, first_name='', last_name=''):
             'first_name': first_name,
             'last_name': last_name,
             'subscribed': 0,
-            'current_state': None
+            'current_state': None,
+            'is_blocked': 0
         }
 
 def update_user_state(vk_id, state):
@@ -315,7 +323,7 @@ def delete_promotion(promo_id):
 def get_subscribers():
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute('SELECT id, vk_id FROM users WHERE subscribed = 1')
+    cur.execute('SELECT id, vk_id FROM users WHERE subscribed = 1 AND is_blocked = 0')
     rows = cur.fetchall()
     conn.close()
     return [dict(row) for row in rows]
@@ -353,6 +361,54 @@ def was_sent_this_week(promo_id, user_id):
     conn.close()
     return result
 
+# ---------- Функции для управления пользователями ----------
+def get_users_page(page=1, per_page=USERS_PER_PAGE):
+    offset = (page - 1) * per_page
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('''
+        SELECT vk_id, first_name, last_name, subscribed, is_blocked, last_interaction
+        FROM users
+        ORDER BY last_interaction DESC
+        LIMIT ? OFFSET ?
+    ''', (per_page, offset))
+    rows = cur.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+def get_total_users():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('SELECT COUNT(*) as cnt FROM users')
+    cnt = cur.fetchone()['cnt']
+    conn.close()
+    return cnt
+
+def update_subscription_admin(vk_id, subscribed):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('UPDATE users SET subscribed = ? WHERE vk_id = ?', (1 if subscribed else 0, vk_id))
+    conn.commit()
+    conn.close()
+
+def set_user_block(vk_id, block=True):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('UPDATE users SET is_blocked = ? WHERE vk_id = ?', (1 if block else 0, vk_id))
+    if block:
+        cur.execute('UPDATE users SET current_state = NULL WHERE vk_id = ?', (vk_id,))
+    conn.commit()
+    conn.close()
+
+def is_user_blocked(vk_id):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('SELECT is_blocked FROM users WHERE vk_id = ?', (vk_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row and row['is_blocked'] == 1
+# ===========================================================================
+
 # ================== КЛАВИАТУРЫ =============================================
 def get_main_menu_keyboard():
     kb = VkKeyboard(one_time=False)
@@ -375,6 +431,10 @@ def get_admin_keyboard():
     kb.add_button('📨 Разослать акцию', color=VkKeyboardColor.POSITIVE)
     kb.add_button('⏰ Установить время', color=VkKeyboardColor.PRIMARY)
     kb.add_line()
+    kb.add_button('👥 Пользователи', color=VkKeyboardColor.PRIMARY)
+    kb.add_button('🔒 Блокировка', color=VkKeyboardColor.NEGATIVE)
+    kb.add_button('📧 Подписки', color=VkKeyboardColor.POSITIVE)
+    kb.add_line()
     kb.add_button('💬 Ответить пользователю', color=VkKeyboardColor.PRIMARY)
     kb.add_button('🚫 Отключить бота', color=VkKeyboardColor.NEGATIVE)
     kb.add_button('✅ Включить бота', color=VkKeyboardColor.POSITIVE)
@@ -385,41 +445,51 @@ def get_admin_keyboard():
 def get_empty_keyboard():
     return VkKeyboard.get_empty_keyboard()
 
-def get_keyboard_yes_no():
+# ---- Клавиатуры для опроса (с поддержкой кнопки "Назад") ----
+def get_q1_keyboard():
     kb = VkKeyboard(one_time=True)
     kb.add_button('Да', color=VkKeyboardColor.POSITIVE)
     kb.add_button('Нет', color=VkKeyboardColor.NEGATIVE)
-    return kb.get_keyboard()
+    return kb
 
-def get_keyboard_audit():
+def get_q2_keyboard():
     kb = VkKeyboard(one_time=True)
     kb.add_button('Да', color=VkKeyboardColor.POSITIVE)
     kb.add_button('Нет', color=VkKeyboardColor.NEGATIVE)
     kb.add_line()
     kb.add_button('Уже делали', color=VkKeyboardColor.PRIMARY)
-    return kb.get_keyboard()
+    kb.add_line()
+    kb.add_button('🔙 Назад', color=VkKeyboardColor.SECONDARY)
+    return kb
 
-def get_keyboard_content():
+def get_q3_keyboard():
     kb = VkKeyboard(one_time=True)
     kb.add_button('Да', color=VkKeyboardColor.POSITIVE)
     kb.add_button('Нет', color=VkKeyboardColor.NEGATIVE)
     kb.add_line()
     kb.add_button('Частично', color=VkKeyboardColor.PRIMARY)
-    return kb.get_keyboard()
+    kb.add_line()
+    kb.add_button('🔙 Назад', color=VkKeyboardColor.SECONDARY)
+    return kb
 
-def get_keyboard_advertising():
+def get_q4_keyboard():
     kb = VkKeyboard(one_time=True)
     kb.add_button('Реклама', color=VkKeyboardColor.PRIMARY)
     kb.add_button('Аудит', color=VkKeyboardColor.PRIMARY)
     kb.add_line()
     kb.add_button('Оба варианта', color=VkKeyboardColor.POSITIVE)
-    return kb.get_keyboard()
+    kb.add_line()
+    kb.add_button('🔙 Назад', color=VkKeyboardColor.SECONDARY)
+    return kb
 
-def get_keyboard_subscribe():
+def get_subscribe_keyboard():
     kb = VkKeyboard(one_time=True)
     kb.add_button('Да', color=VkKeyboardColor.POSITIVE)
     kb.add_button('Нет', color=VkKeyboardColor.NEGATIVE)
-    return kb.get_keyboard()
+    kb.add_line()
+    kb.add_button('🔙 Назад', color=VkKeyboardColor.SECONDARY)
+    return kb
+# ===========================================================================
 
 # ================== ОСНОВНОЙ КЛАСС БОТА ====================================
 class VKBot:
@@ -442,10 +512,9 @@ class VKBot:
         self.disabled_until = BOT_DISABLED_UNTIL
 
         self.admin_states = {}       # состояния для админов
-        self.user_temp_data = {}     # временные данные для заявок (имя, телефон, email)
+        self.user_temp_data = {}     # временные данные для заявок и опросов
 
     def send_message(self, user_id, message, keyboard=None, attachment=None):
-        """Отправка сообщения с обработкой ошибок доставки."""
         try:
             self.vk.messages.send(
                 user_id=user_id,
@@ -455,8 +524,6 @@ class VKBot:
                 attachment=attachment
             )
         except ApiError as e:
-            # Код 901: нельзя отправить сообщение пользователю (например, заблокировал бота)
-            # Код 404406378: доступ запрещён (пользователь запретил сообщения от сообщества)
             if e.code in [901, 404406378]:
                 logger.warning(f"Не удалось отправить сообщение пользователю {user_id}: {e} (код {e.code})")
             else:
@@ -465,7 +532,6 @@ class VKBot:
             logger.error(f"Неизвестная ошибка при отправке сообщения пользователю {user_id}: {e}")
 
     def notify_admins(self, message, attachment=None):
-        """Отправить уведомление всем администраторам с обработкой ошибок."""
         for admin_id in ADMIN_IDS:
             try:
                 self.send_message(admin_id, message, attachment=attachment)
@@ -480,13 +546,11 @@ class VKBot:
         return False
 
     def check_timeout_and_reset(self, user_id, user):
-        """Проверяет, не истек ли тайм-аут неактивности, и сбрасывает состояние при необходимости."""
         if not user['current_state']:
             return False
         last_interaction = datetime.strptime(user['last_interaction'], '%Y-%m-%d %H:%M:%S')
         if datetime.now() - last_interaction > timedelta(minutes=TIMEOUT_MINUTES):
             logger.info(f"Тайм-аут для пользователя {user_id}, сбрасываем состояние.")
-            # Очищаем временные данные
             if user_id in self.user_temp_data:
                 del self.user_temp_data[user_id]
             clear_user_state(user_id)
@@ -496,7 +560,6 @@ class VKBot:
         return False
 
     def handle_event(self, event):
-        """Обработка события с гарантированным перехватом всех исключений."""
         try:
             if self.is_bot_disabled():
                 if event.from_user:
@@ -518,12 +581,13 @@ class VKBot:
         last_name = event.message.get('last_name', '')
         user = get_or_create_user(user_id, first_name, last_name)
 
-        # Проверка тайм-аута: если пользователь в состоянии и прошло больше TIMEOUT_MINUTES, сбрасываем
-        if self.check_timeout_and_reset(user_id, user):
-            # После сброса выходим, так как пользователь уже получил меню и его состояние очищено
+        if is_user_blocked(user_id):
+            logger.info(f"Заблокированный пользователь {user_id} попытался отправить сообщение. Игнорируем.")
             return
 
-        # Уведомление админов о новом сообщении от пользователя (кроме команд)
+        if self.check_timeout_and_reset(user_id, user):
+            return
+
         if not is_admin(user_id) and not text.startswith('/'):
             self.notify_admins(
                 f"📩 **Новое сообщение**\n"
@@ -531,7 +595,6 @@ class VKBot:
                 f"Текст: {text}"
             )
 
-        # Команда "Меню" сбрасывает всё и показывает главное меню
         if text.lower() == 'меню':
             if user_id in self.user_temp_data:
                 del self.user_temp_data[user_id]
@@ -539,22 +602,18 @@ class VKBot:
             self.send_main_menu(user_id)
             return
 
-        # Состояния администратора
         if user_id in self.admin_states:
             self.handle_admin_state_input(event)
             return
 
-        # Команды администратора
         if text.startswith('/') and is_admin(user_id):
             self.process_admin_command(event)
             return
 
-        # Обработка состояний пользователя (опрос, заявка)
         if user['current_state']:
             self.handle_stateful_response(event, user)
             return
 
-        # Кнопки главного меню
         if text == '📢 Акции':
             self.show_promotions(user_id)
         elif text == '📝 Отправить заявку':
@@ -596,7 +655,6 @@ class VKBot:
         self.send_main_menu(user_id)
 
     def start_request(self, user_id):
-        """Начинает поэтапный сбор имени, телефона и email."""
         self.user_temp_data[user_id] = {}
         update_user_state(user_id, 'request_name')
         msg = "📝 Введите ваше имя:"
@@ -607,7 +665,6 @@ class VKBot:
         state = user['current_state']
         text = event.message['text'].strip()
 
-        # Если временные данные отсутствуют (например, после перезапуска бота) - инициализируем
         if user_id not in self.user_temp_data:
             self.user_temp_data[user_id] = {}
 
@@ -617,7 +674,6 @@ class VKBot:
             self.send_message(user_id, "📞 Введите ваш контактный телефон:", get_empty_keyboard())
 
         elif state == 'request_phone':
-            # Проверяем, что имя уже сохранено, иначе начинаем заново
             if 'name' not in self.user_temp_data[user_id]:
                 logger.warning(f"Для пользователя {user_id} отсутствует имя в состоянии request_phone. Сброс.")
                 clear_user_state(user_id)
@@ -628,7 +684,6 @@ class VKBot:
             self.send_message(user_id, "📧 Введите ваш email:", get_empty_keyboard())
 
         elif state == 'request_email':
-            # Проверяем наличие всех предыдущих данных
             if 'name' not in self.user_temp_data[user_id] or 'phone' not in self.user_temp_data[user_id]:
                 logger.warning(f"Для пользователя {user_id} отсутствуют имя или телефон в состоянии request_email. Сброс.")
                 clear_user_state(user_id)
@@ -642,7 +697,6 @@ class VKBot:
             full_request = f"Имя: {name}\nТелефон: {phone}\nEmail: {email}"
             user_info = save_request(user_id, full_request)
 
-            # Уведомление администраторам
             notification = (
                 f"📬 **Новая заявка** от пользователя\n"
                 f"ID: {user_id}\n"
@@ -651,15 +705,16 @@ class VKBot:
             )
             self.notify_admins(notification)
 
-            # Подтверждение пользователю
             self.send_message(user_id, "✅ Спасибо! Мы свяжемся с вами в ближайшее время.", get_empty_keyboard())
             clear_user_state(user_id)
             self.send_main_menu(user_id)
 
     def start_survey(self, user_id):
+        # Инициализируем временное хранилище для ответов
+        self.user_temp_data[user_id] = {'survey_answers': []}
         update_user_state(user_id, 'q1')
         msg = "🔹 **Вопрос 1 из 4**\nЕсть ли у вас сайт?"
-        kb = get_keyboard_yes_no()
+        kb = get_q1_keyboard().get_keyboard()
         self.send_message(user_id, msg, kb)
 
     def handle_survey_response(self, event, user):
@@ -667,45 +722,56 @@ class VKBot:
         state = user['current_state']
         text = event.message['text'].strip()
 
+        # Если временные данные отсутствуют, инициализируем (на случай сбоя)
+        if user_id not in self.user_temp_data or 'survey_answers' not in self.user_temp_data[user_id]:
+            self.user_temp_data[user_id] = {'survey_answers': []}
+
+        # Обработка кнопки "Назад"
+        if text == '🔙 Назад':
+            self.handle_survey_back(user_id, state)
+            return
+
+        # Обычный ответ на вопрос
         if state == 'q1':
             if text not in ['Да', 'Нет']:
                 self.send_message(user_id, "Пожалуйста, выберите один из вариантов на кнопках.")
                 return
-            save_answer(user_id, 'Есть ли у вас сайт?', text)
+            # Сохраняем ответ временно
+            self.user_temp_data[user_id]['survey_answers'].append(('Есть ли у вас сайт?', text))
             update_user_state(user_id, 'q2')
             msg = "🔹 **Вопрос 2 из 4**\nНужно ли провести аудит сайта?"
-            kb = get_keyboard_audit()
+            kb = get_q2_keyboard().get_keyboard()
             self.send_message(user_id, msg, kb)
 
         elif state == 'q2':
             if text not in ['Да', 'Нет', 'Уже делали']:
                 self.send_message(user_id, "Пожалуйста, выберите один из вариантов на кнопках.")
                 return
-            save_answer(user_id, 'Нужно ли провести аудит сайта?', text)
+            self.user_temp_data[user_id]['survey_answers'].append(('Нужно ли провести аудит сайта?', text))
             update_user_state(user_id, 'q3')
             msg = "🔹 **Вопрос 3 из 4**\nТребуется ли переделать контент?"
-            kb = get_keyboard_content()
+            kb = get_q3_keyboard().get_keyboard()
             self.send_message(user_id, msg, kb)
 
         elif state == 'q3':
             if text not in ['Да', 'Нет', 'Частично']:
                 self.send_message(user_id, "Пожалуйста, выберите один из вариантов на кнопках.")
                 return
-            save_answer(user_id, 'Требуется ли переделать контент?', text)
+            self.user_temp_data[user_id]['survey_answers'].append(('Требуется ли переделать контент?', text))
             update_user_state(user_id, 'q4')
             msg = "🔹 **Вопрос 4 из 4**\nВам нужна реклама или только аудит?"
-            kb = get_keyboard_advertising()
+            kb = get_q4_keyboard().get_keyboard()
             self.send_message(user_id, msg, kb)
 
         elif state == 'q4':
             if text not in ['Реклама', 'Аудит', 'Оба варианта']:
                 self.send_message(user_id, "Пожалуйста, выберите один из вариантов на кнопках.")
                 return
-            save_answer(user_id, 'Вам нужна реклама или только аудит?', text)
+            self.user_temp_data[user_id]['survey_answers'].append(('Вам нужна реклама или только аудит?', text))
             update_user_state(user_id, 'subscribe')
             msg = ("✅ Спасибо за ответы! Мы свяжемся с вами в ближайшее время.\n\n"
                    "Хотите получать информацию о наших акциях?")
-            kb = get_keyboard_subscribe()
+            kb = get_subscribe_keyboard().get_keyboard()
             self.send_message(user_id, msg, kb)
 
         elif state == 'subscribe':
@@ -715,18 +781,13 @@ class VKBot:
             subscribed = (text == 'Да')
             set_subscription(user_id, subscribed)
 
-            # Отправляем администраторам результаты опроса в улучшенном формате
-            conn = get_db_connection()
-            cur = conn.cursor()
-            cur.execute('''
-                SELECT question, answer FROM survey_answers
-                WHERE user_id = ? ORDER BY answered_at
-            ''', (user['id'],))
-            answers_rows = cur.fetchall()
-            conn.close()
+            # Сохраняем все накопленные ответы в БД
+            answers = self.user_temp_data[user_id].get('survey_answers', [])
+            for question, answer in answers:
+                save_answer(user_id, question, answer)
 
-            if answers_rows:
-                # Словарь для сопоставления вопросов с эмодзи
+            # Отправляем администраторам результаты опроса
+            if answers:
                 emoji_map = {
                     'Есть ли у вас сайт?': '🌐',
                     'Нужно ли провести аудит сайта?': '🔍',
@@ -734,8 +795,7 @@ class VKBot:
                     'Вам нужна реклама или только аудит?': '📊'
                 }
                 answers_text = '\n'.join([
-                    f"{emoji_map.get(row['question'], '•')} {row['question']}: {row['answer']}"
-                    for row in answers_rows
+                    f"{emoji_map.get(q, '•')} {q}: {a}" for q, a in answers
                 ])
                 admin_msg = (
                     f"📝 **Новый опрос пройден**\n"
@@ -744,6 +804,10 @@ class VKBot:
                 )
                 self.notify_admins(admin_msg)
 
+            # Очищаем временные данные
+            if user_id in self.user_temp_data:
+                del self.user_temp_data[user_id]
+
             clear_user_state(user_id)
             if subscribed:
                 msg = "🔔 Отлично! Вы подписались на акции. Будем присылать самое интересное."
@@ -751,6 +815,53 @@ class VKBot:
                 msg = "⏸️ Хорошо, если передумаете - всегда можете написать мне."
             self.send_message(user_id, msg, get_empty_keyboard())
             self.send_main_menu(user_id)
+
+    def handle_survey_back(self, user_id, current_state):
+        """Обработка нажатия кнопки 'Назад' в опросе."""
+        # Определяем предыдущее состояние
+        prev_state_map = {
+            'q2': 'q1',
+            'q3': 'q2',
+            'q4': 'q3',
+            'subscribe': 'q4'
+        }
+        if current_state not in prev_state_map:
+            # Для первого вопроса назад быть не должно, но на всякий случай
+            self.send_message(user_id, "Вы не можете вернуться назад.")
+            return
+
+        prev_state = prev_state_map[current_state]
+
+        # Удаляем последний ответ из временного хранилища
+        if user_id in self.user_temp_data and 'survey_answers' in self.user_temp_data[user_id]:
+            if self.user_temp_data[user_id]['survey_answers']:
+                removed = self.user_temp_data[user_id]['survey_answers'].pop()
+                logger.info(f"Пользователь {user_id} отменил ответ: {removed}")
+
+        # Обновляем состояние в БД
+        update_user_state(user_id, prev_state)
+
+        # Отправляем сообщение с предыдущим вопросом
+        if prev_state == 'q1':
+            msg = "🔹 **Вопрос 1 из 4**\nЕсть ли у вас сайт?"
+            kb = get_q1_keyboard().get_keyboard()
+        elif prev_state == 'q2':
+            msg = "🔹 **Вопрос 2 из 4**\nНужно ли провести аудит сайта?"
+            kb = get_q2_keyboard().get_keyboard()
+        elif prev_state == 'q3':
+            msg = "🔹 **Вопрос 3 из 4**\nТребуется ли переделать контент?"
+            kb = get_q3_keyboard().get_keyboard()
+        elif prev_state == 'q4':
+            msg = "🔹 **Вопрос 4 из 4**\nВам нужна реклама или только аудит?"
+            kb = get_q4_keyboard().get_keyboard()
+        else:
+            # На всякий случай
+            self.send_message(user_id, "Произошла ошибка. Возврат в меню.")
+            clear_user_state(user_id)
+            self.send_main_menu(user_id)
+            return
+
+        self.send_message(user_id, msg, kb)
 
     def handle_stateful_response(self, event, user):
         state = user['current_state']
@@ -775,7 +886,6 @@ class VKBot:
             self.handle_admin_state_input(event)
             return
 
-        # Команды для входа в админ-панель (добавлена /adminka)
         if cmd in ('/admin', '/adminka', '/start', '/help'):
             self.show_admin_panel(user_id)
         elif cmd == '/stats':
@@ -831,6 +941,36 @@ class VKBot:
             self.admin_disable(user_id)
         elif cmd == '/enable':
             self.admin_enable(user_id)
+        elif cmd == '/users':
+            self.admin_list_users(user_id, args)
+        elif cmd == '/subscribe':
+            if len(args) < 2:
+                self.send_message(user_id, "Использование: /subscribe <vk_id> <1/0>")
+                return
+            try:
+                target_id = int(args[0])
+                sub_val = int(args[1])
+                self.admin_manage_subscription(user_id, target_id, sub_val)
+            except ValueError:
+                self.send_message(user_id, "ID должен быть числом, подписка 1 или 0.")
+        elif cmd == '/block':
+            if len(args) < 1:
+                self.send_message(user_id, "Использование: /block <vk_id>")
+                return
+            try:
+                target_id = int(args[0])
+                self.admin_block_user(user_id, target_id)
+            except ValueError:
+                self.send_message(user_id, "ID должен быть числом.")
+        elif cmd == '/unblock':
+            if len(args) < 1:
+                self.send_message(user_id, "Использование: /unblock <vk_id>")
+                return
+            try:
+                target_id = int(args[0])
+                self.admin_unblock_user(user_id, target_id)
+            except ValueError:
+                self.send_message(user_id, "ID должен быть числом.")
         else:
             self.handle_admin_button(user_id, text)
 
@@ -857,6 +997,14 @@ class VKBot:
         elif button_text == '⏰ Установить время':
             self.send_message(user_id, "Введите новое время рассылки в формате HH:MM (например, 10:00):")
             self.admin_states[user_id] = {'action': 'set_mailing_time_input', 'step': 0}
+        elif button_text == '👥 Пользователи':
+            self.admin_list_users(user_id, [])
+        elif button_text == '🔒 Блокировка':
+            self.send_message(user_id, "Введите ID пользователя для блокировки (команда /block <id>):")
+            self.admin_states[user_id] = {'action': 'block_input', 'step': 0}
+        elif button_text == '📧 Подписки':
+            self.send_message(user_id, "Введите ID пользователя и статус подписки (1 или 0) через пробел, например: 123456789 1")
+            self.admin_states[user_id] = {'action': 'subscribe_input', 'step': 0}
         elif button_text == '💬 Ответить пользователю':
             self.send_message(user_id, "Введите ID пользователя VK и текст сообщения через пробел (например, 123456789 Привет!):")
             self.admin_states[user_id] = {'action': 'reply_input', 'step': 0}
@@ -919,6 +1067,27 @@ class VKBot:
             self.admin_reply(user_id, target_id, reply_text)
             del self.admin_states[user_id]
             self.show_admin_panel(user_id)
+        elif action == 'block_input':
+            try:
+                target_id = int(text)
+                self.admin_block_user(user_id, target_id)
+            except ValueError:
+                self.send_message(user_id, "ID должен быть числом.")
+            del self.admin_states[user_id]
+            self.show_admin_panel(user_id)
+        elif action == 'subscribe_input':
+            parts = text.split()
+            if len(parts) < 2:
+                self.send_message(user_id, "Нужно указать ID и статус. Пример: 123456789 1")
+                return
+            try:
+                target_id = int(parts[0])
+                sub_val = int(parts[1])
+                self.admin_manage_subscription(user_id, target_id, sub_val)
+            except ValueError:
+                self.send_message(user_id, "ID и статус должны быть числами.")
+            del self.admin_states[user_id]
+            self.show_admin_panel(user_id)
         else:
             logger.warning(f"Неизвестное действие админа {action}")
             del self.admin_states[user_id]
@@ -945,6 +1114,9 @@ class VKBot:
             "❌ Удалить акцию\n"
             "📨 Разослать акцию вручную\n"
             "⏰ Установить время рассылки\n"
+            "👥 Пользователи\n"
+            "🔒 Блокировка\n"
+            "📧 Подписки\n"
             "💬 Ответить пользователю\n"
             "🚫 Отключить бота\n"
             "✅ Включить бота\n\n"
@@ -962,11 +1134,14 @@ class VKBot:
         subscribed = cur.fetchone()['total']
         cur.execute('SELECT COUNT(DISTINCT user_id) as total FROM survey_answers')
         surveyed = cur.fetchone()['total']
+        cur.execute('SELECT COUNT(*) as total FROM users WHERE is_blocked = 1')
+        blocked = cur.fetchone()['total']
         conn.close()
         msg = (f"📊 **Статистика**\n"
                f"Всего пользователей: {total}\n"
                f"Прошли опрос: {surveyed}\n"
-               f"Подписаны на акции: {subscribed}")
+               f"Подписаны на акции: {subscribed}\n"
+               f"Заблокировано: {blocked}")
         self.send_message(user_id, msg)
         log_admin_action(user_id, 'stats', msg)
         self.show_admin_panel(user_id)
@@ -1052,7 +1227,7 @@ class VKBot:
             self.send_message(user_id, f"Не удалось загрузить файл. Ошибка: {e}")
         self.show_admin_panel(user_id)
 
-    # ---------- Управление акциями (админ) ----------
+    # ---------- Управление акциями ----------
     def start_add_promo(self, user_id):
         self.admin_states[user_id] = {'action': 'add_promo', 'step': 1, 'data': {}}
         self.send_message(user_id, "Введите **название** акции:")
@@ -1244,6 +1419,88 @@ class VKBot:
         self.send_message(user_id, "✅ Бот включен.")
         log_admin_action(user_id, 'enable')
         self.show_admin_panel(user_id)
+
+    # ---------- Управление пользователями ----------
+    def admin_list_users(self, user_id, args):
+        page = 1
+        if args and args[0].isdigit():
+            page = int(args[0])
+        total = get_total_users()
+        max_page = (total + USERS_PER_PAGE - 1) // USERS_PER_PAGE
+        if page < 1:
+            page = 1
+        if page > max_page and max_page > 0:
+            page = max_page
+
+        users = get_users_page(page, USERS_PER_PAGE)
+        if not users:
+            self.send_message(user_id, "Нет пользователей.")
+        else:
+            lines = [f"👥 **Пользователи (страница {page}/{max_page})**"]
+            for u in users:
+                sub_emoji = "✅" if u['subscribed'] else "❌"
+                block_emoji = "🔒" if u['is_blocked'] else "🟢"
+                last_inter = u['last_interaction'][:16]
+                lines.append(
+                    f"ID {u['vk_id']}: {u['first_name']} {u['last_name']} | "
+                    f"Подписка: {sub_emoji} | Блок: {block_emoji} | Посл.: {last_inter}"
+                )
+            lines.append(f"\nДля перехода к другой странице введите /users N (где N - номер страницы)")
+            self.send_message(user_id, '\n'.join(lines))
+        log_admin_action(user_id, 'list_users', f"page={page}")
+        self.show_admin_panel(user_id)
+
+    def admin_manage_subscription(self, admin_id, target_vk_id, sub_value):
+        if sub_value not in (0, 1):
+            self.send_message(admin_id, "Статус подписки должен быть 1 (подписать) или 0 (отписать).")
+            return
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute('SELECT id FROM users WHERE vk_id = ?', (target_vk_id,))
+        if not cur.fetchone():
+            conn.close()
+            self.send_message(admin_id, f"Пользователь с ID {target_vk_id} не найден в базе.")
+            return
+        conn.close()
+
+        update_subscription_admin(target_vk_id, bool(sub_value))
+        status = "подписан" if sub_value else "отписан"
+        self.send_message(admin_id, f"✅ Пользователь {target_vk_id} успешно {status}.")
+        log_admin_action(admin_id, 'manage_subscription', f"target={target_vk_id}, set={sub_value}")
+        self.show_admin_panel(admin_id)
+
+    def admin_block_user(self, admin_id, target_vk_id):
+        if target_vk_id in ADMIN_IDS:
+            self.send_message(admin_id, "❌ Нельзя заблокировать администратора.")
+            return
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute('SELECT id FROM users WHERE vk_id = ?', (target_vk_id,))
+        if not cur.fetchone():
+            conn.close()
+            self.send_message(admin_id, f"Пользователь с ID {target_vk_id} не найден в базе.")
+            return
+        conn.close()
+
+        set_user_block(target_vk_id, block=True)
+        self.send_message(admin_id, f"🔒 Пользователь {target_vk_id} заблокирован.")
+        log_admin_action(admin_id, 'block_user', f"target={target_vk_id}")
+        self.show_admin_panel(admin_id)
+
+    def admin_unblock_user(self, admin_id, target_vk_id):
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute('SELECT id FROM users WHERE vk_id = ?', (target_vk_id,))
+        if not cur.fetchone():
+            conn.close()
+            self.send_message(admin_id, f"Пользователь с ID {target_vk_id} не найден в базе.")
+            return
+        conn.close()
+
+        set_user_block(target_vk_id, block=False)
+        self.send_message(admin_id, f"🟢 Пользователь {target_vk_id} разблокирован.")
+        log_admin_action(admin_id, 'unblock_user', f"target={target_vk_id}")
+        self.show_admin_panel(admin_id)
 
     # ============= АВТОМАТИЧЕСКАЯ РАССЫЛКА ===================================
     def mailing_worker(self):
