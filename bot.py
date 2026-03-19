@@ -3,7 +3,7 @@
 
 """
 ВКонтакте бот для сбора потребностей в услугах по продвижению сайтов.
-Версия 3.1 (исправлен сбор заявки по шагам, добавлена обработка "Меню")
+Версия 3.2 (добавлены уведомления админам о сообщениях и опросах)
 """
 
 import os
@@ -235,6 +235,7 @@ def save_request(vk_id, request_text):
                 (user['id'], request_text))
     conn.commit()
     conn.close()
+    return user
 
 def is_admin(vk_id):
     return vk_id in ADMIN_IDS
@@ -452,6 +453,11 @@ class VKBot:
         except vk_api.exceptions.ApiError as e:
             logger.error(f"Ошибка отправки сообщения пользователю {user_id}: {e}")
 
+    def notify_admins(self, message, attachment=None):
+        """Отправить уведомление всем администраторам."""
+        for admin_id in ADMIN_IDS:
+            self.send_message(admin_id, message, attachment=attachment)
+
     def is_bot_disabled(self):
         if not self.enabled:
             return True
@@ -476,6 +482,14 @@ class VKBot:
         first_name = event.message.get('first_name', '')
         last_name = event.message.get('last_name', '')
         user = get_or_create_user(user_id, first_name, last_name)
+
+        # Уведомление админов о новом сообщении от пользователя (кроме команд)
+        if not is_admin(user_id) and not text.startswith('/'):
+            self.notify_admins(
+                f"📩 **Новое сообщение**\n"
+                f"От: {first_name} {last_name} (id{user_id})\n"
+                f"Текст: {text}"
+            )
 
         # Команда "Меню" сбрасывает всё и показывает главное меню
         if text.lower() == 'меню':
@@ -570,18 +584,16 @@ class VKBot:
             phone = data.get('phone', '')
             email = data.get('email', '')
             full_request = f"Имя: {name}\nТелефон: {phone}\nEmail: {email}"
-            save_request(user_id, full_request)
+            user_info = save_request(user_id, full_request)
 
             # Уведомление администраторам
-            user_info = get_or_create_user(user_id)
             notification = (
                 f"📬 **Новая заявка** от пользователя\n"
                 f"ID: {user_id}\n"
                 f"Имя: {user_info['first_name']} {user_info['last_name']}\n"
                 f"{full_request}"
             )
-            for admin_id in ADMIN_IDS:
-                self.send_message(admin_id, notification)
+            self.notify_admins(notification)
 
             # Подтверждение пользователю
             self.send_message(user_id, "✅ Спасибо! Мы свяжемся с вами в ближайшее время.", get_empty_keyboard())
@@ -646,6 +658,23 @@ class VKBot:
                 return
             subscribed = (text == 'Да')
             set_subscription(user_id, subscribed)
+
+            # Отправляем администраторам результаты опроса
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute('''
+                SELECT question, answer, answered_at FROM survey_answers
+                WHERE user_id = ? ORDER BY answered_at
+            ''', (user['id'],))
+            answers_rows = cur.fetchall()
+            conn.close()
+            if answers_rows:
+                answers_text = '\n'.join([f"{row['question']}: {row['answer']}" for row in answers_rows])
+                admin_msg = (f"📝 **Новый опрос пройден**\n"
+                             f"Пользователь: {user['first_name']} {user['last_name']} (id{user_id})\n"
+                             f"Ответы:\n{answers_text}")
+                self.notify_admins(admin_msg)
+
             clear_user_state(user_id)
             if subscribed:
                 msg = "🔔 Отлично! Вы подписались на акции. Будем присылать самое интересное."
