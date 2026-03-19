@@ -3,7 +3,7 @@
 
 """
 ВКонтакте бот для сбора потребностей в услугах по продвижению сайтов.
-Версия 2.1 (конфигурация через системные переменные: GROUP_ID, API_TOKEN, ADMIN_IDS, DATA_DIR)
+Версия 2.2 (исправление: преобразование GROUP_ID из формата clubxxxxx в число)
 """
 
 import os
@@ -30,7 +30,6 @@ except ImportError:
     sys.exit(1)
 
 # ================== НАСТРОЙКА ЛОГИРОВАНИЯ ==================================
-# Используем DATA_DIR для размещения лог-файла
 DATA_DIR = os.getenv('DATA_DIR', '.').rstrip('/')
 if not os.path.exists(DATA_DIR):
     try:
@@ -52,12 +51,12 @@ logger = logging.getLogger('VK_bot')
 # ===========================================================================
 
 # ================== КОНФИГУРАЦИЯ (строго из переменных окружения) ===========
-GROUP_ID = os.getenv('GROUP_ID')
+GROUP_ID_STR = os.getenv('GROUP_ID')
 API_TOKEN = os.getenv('API_TOKEN')
 admin_ids_str = os.getenv('ADMIN_IDS')
 
 # Проверка обязательных переменных
-if not GROUP_ID:
+if not GROUP_ID_STR:
     logger.error("Переменная окружения GROUP_ID не задана.")
     sys.exit(1)
 
@@ -67,6 +66,19 @@ if not API_TOKEN:
 
 if not admin_ids_str:
     logger.error("Переменная окружения ADMIN_IDS не задана.")
+    sys.exit(1)
+
+def parse_group_id(group_id_str):
+    """Преобразует строку с ID группы в число, убирая возможный префикс 'club'."""
+    if group_id_str.startswith('club'):
+        return int(group_id_str[4:])
+    else:
+        return int(group_id_str)
+
+try:
+    GROUP_ID = parse_group_id(GROUP_ID_STR)
+except ValueError:
+    logger.error("GROUP_ID должен быть числом или строкой вида club<число>.")
     sys.exit(1)
 
 # Парсим список администраторов
