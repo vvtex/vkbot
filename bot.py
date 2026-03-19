@@ -3,10 +3,11 @@
 
 """
 ВКонтакте бот для сбора потребностей в услугах по продвижению сайтов.
-Версия 1.1 (с использованием переменных окружения)
+Версия 1.2 (с проверкой наличия vk_api)
 """
 
 import os
+import sys
 import sqlite3
 import logging
 import threading
@@ -16,10 +17,18 @@ import io
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
-import vk_api
-from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
-from vk_api.keyboard import VkKeyboard, VkKeyboardColor
-from vk_api.utils import get_random_id
+# Проверка наличия обязательной библиотеки vk_api
+try:
+    import vk_api
+    from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
+    from vk_api.keyboard import VkKeyboard, VkKeyboardColor
+    from vk_api.utils import get_random_id
+except ImportError:
+    print("="*60)
+    print("ОШИБКА: не установлена библиотека vk_api.")
+    print("Установите её командой: pip install vk-api")
+    print("="*60)
+    sys.exit(1)
 
 # ================== КОНФИГУРАЦИЯ (переменные окружения) ==================
 # Обязательные переменные
