@@ -3,7 +3,7 @@
 
 """
 ВКонтакте бот для сбора потребностей в услугах по продвижению сайтов.
-Версия 4.1 (исправлена обработка callback-событий, добавлен сброс опроса)
+Версия 4.3 (добавлены отложенные рассылки и триггер по фразе "скидка 10 процентов")
 """
 
 import os
@@ -100,6 +100,10 @@ BOT_ENABLED = True
 BOT_DISABLED_UNTIL = None
 TIMEOUT_MINUTES = 10  # тайм-аут неактивности пользователя (в минутах)
 USERS_PER_PAGE = 10   # количество пользователей на странице в списке
+
+# Константы для отложенных рассылок
+PROMO_MESSAGE = "🎁 **Специальное предложение!**\n\nСкидка 10% на все услуги по промокоду: **BOT10**\nДействует до конца месяца!"
+PROMO_TRIGGER_PHRASE = "скидка 10 процентов"
 # ===========================================================================
 
 # ================== РАБОТА С БАЗОЙ ДАННЫХ ==================================
@@ -455,7 +459,6 @@ def get_q1_inline_keyboard(selected=None):
             label = "✅ " + opt
         kb.add_callback_button(label, color=VkKeyboardColor.PRIMARY, payload={"type": "survey", "q": "q1", "opt": opt})
         kb.add_line()
-    # Кнопка "Далее" (но на первом вопросе нет "Назад")
     kb.add_callback_button("➡️ Далее", color=VkKeyboardColor.POSITIVE, payload={"type": "survey", "q": "q1", "action": "next"})
     return kb.get_keyboard()
 
@@ -467,7 +470,6 @@ def get_q2_inline_keyboard(selected=None):
             label = "✅ " + opt
         kb.add_callback_button(label, color=VkKeyboardColor.PRIMARY, payload={"type": "survey", "q": "q2", "opt": opt})
         kb.add_line()
-    # Две кнопки: Назад и Сброс (и Далее)
     kb.add_callback_button("⬅️ Назад", color=VkKeyboardColor.SECONDARY, payload={"type": "survey", "q": "q2", "action": "back"})
     kb.add_callback_button("🔄 Сброс", color=VkKeyboardColor.NEGATIVE, payload={"type": "survey", "q": "q2", "action": "reset"})
     kb.add_callback_button("➡️ Далее", color=VkKeyboardColor.POSITIVE, payload={"type": "survey", "q": "q2", "action": "next"})
@@ -526,8 +528,8 @@ class VKBot:
         self.enabled = BOT_ENABLED
         self.disabled_until = BOT_DISABLED_UNTIL
 
-        self.admin_states = {}       # состояния для админов
-        self.user_temp_data = {}     # временные данные для заявок и опросов
+        self.admin_states = {}
+        self.user_temp_data = {}
 
     def send_message(self, user_id, message, keyboard=None, attachment=None):
         try:
@@ -546,24 +548,21 @@ class VKBot:
         except Exception as e:
             logger.error(f"Неизвестная ошибка при отправке сообщения пользователю {user_id}: {e}")
 
-    def edit_message(self, user_id, message_id, message, keyboard=None):
-        """Безопасное редактирование сообщения."""
+    def edit_message(self, user_id, message_id, message_text, keyboard=None):
         try:
             self.vk.messages.edit(
                 peer_id=user_id,
                 message_id=message_id,
-                message=message,
+                message=message_text,
                 keyboard=keyboard
             )
         except ApiError as e:
-            # Ошибка 901: сообщение уже было отредактировано или не найдено
             if e.code != 901:
                 logger.error(f"Ошибка при редактировании сообщения для пользователя {user_id}: {e}")
         except Exception as e:
             logger.error(f"Неизвестная ошибка при редактировании: {e}")
 
     def answer_callback(self, event):
-        """Отправляет подтверждение callback-события, чтобы убрать крутилку."""
         try:
             self.vk.messages.sendMessageEventAnswer(
                 event_id=event.object['event_id'],
@@ -613,7 +612,6 @@ class VKBot:
             if event.type == VkBotEventType.MESSAGE_NEW and event.from_user:
                 self.handle_message(event)
             elif event.type == VkBotEventType.MESSAGE_EVENT:
-                # Всегда отвечаем на callback, даже если произойдёт ошибка
                 self.answer_callback(event)
                 self.handle_message_event(event)
         except Exception as e:
@@ -621,7 +619,6 @@ class VKBot:
             logger.error(traceback.format_exc())
 
     def handle_message_event(self, event):
-        """Обработка нажатий на inline-кнопки (безопасно)."""
         try:
             user_id = event.object['user_id']
             payload = event.object['payload']
@@ -643,27 +640,27 @@ class VKBot:
     def handle_survey_callback(self, event, user, payload):
         user_id = user['vk_id']
         state = user['current_state']
+
         if not state or not state.startswith('q'):
-            logger.warning(f"Пользователь {user_id} нажал кнопку опроса, но состояние {state}")
+            logger.warning(f"Пользователь {user_id} нажал кнопку опроса, но состояние {state}. Игнорируем.")
             return
 
-        # Инициализируем временные данные, если нужно
         if user_id not in self.user_temp_data:
             self.user_temp_data[user_id] = {'survey_answers': {}}
 
         current_q = state
-        # Если это выбор варианта
+
         if 'opt' in payload:
             selected_opt = payload['opt']
             self.user_temp_data[user_id]['survey_answers'][current_q] = selected_opt
             new_kb = self.get_updated_keyboard(current_q, selected_opt)
+            message_text = event.object.get('message', '')
             self.edit_message(
                 user_id,
                 event.object['conversation_message_id'],
-                event.object['message'],
+                message_text,
                 keyboard=new_kb
             )
-        # Обработка действий "next", "back", "reset", "finish"
         elif 'action' in payload:
             action = payload['action']
             if action == 'next':
@@ -674,9 +671,6 @@ class VKBot:
                 if next_state:
                     update_user_state(user_id, next_state)
                     self.send_survey_question(user_id, next_state)
-                else:
-                    # Если следующего нет, возможно, завершение (но обычно finish)
-                    pass
             elif action == 'back':
                 prev_state = self.get_prev_state(current_q)
                 if prev_state:
@@ -687,7 +681,6 @@ class VKBot:
                 else:
                     self.send_message(user_id, "Вы не можете вернуться назад.")
             elif action == 'reset':
-                # Полный сброс опроса
                 if user_id in self.user_temp_data:
                     del self.user_temp_data[user_id]
                 clear_user_state(user_id)
@@ -698,11 +691,14 @@ class VKBot:
                     return
                 update_user_state(user_id, 'subscribe')
                 self.send_subscribe_question(user_id)
+
         elif 'action' in payload and payload['action'].startswith('subscribe_'):
+            if state != 'subscribe':
+                logger.warning(f"Пользователь {user_id} нажал кнопку подписки, но состояние {state}")
+                return
             subscribed = (payload['action'] == 'subscribe_yes')
             set_subscription(user_id, subscribed)
 
-            # Сохраняем все ответы в БД
             answers = self.user_temp_data[user_id].get('survey_answers', {})
             question_map = {
                 'q1': 'Есть ли у вас сайт?',
@@ -735,6 +731,7 @@ class VKBot:
             if user_id in self.user_temp_data:
                 del self.user_temp_data[user_id]
             clear_user_state(user_id)
+
             if subscribed:
                 msg = "🔔 Отлично! Вы подписались на акции. Будем присылать самое интересное."
             else:
@@ -798,7 +795,7 @@ class VKBot:
 
     def handle_message(self, event):
         user_id = event.message['from_id']
-        text = event.message['text'].strip()
+        text = event.message['text'].strip().lower()
         first_name = event.message.get('first_name', '')
         last_name = event.message.get('last_name', '')
         user = get_or_create_user(user_id, first_name, last_name)
@@ -806,6 +803,13 @@ class VKBot:
         if is_user_blocked(user_id):
             logger.info(f"Заблокированный пользователь {user_id} попытался отправить сообщение. Игнорируем.")
             return
+
+        # Обработка триггерной фразы "скидка 10 процентов"
+        if PROMO_TRIGGER_PHRASE in text:
+            self.send_message(user_id, PROMO_MESSAGE)
+            # Не возвращаемся, чтобы дать возможность обработать и другие команды, но чтобы не зацикливать,
+            # лучше просто отправить и продолжить, но если нужно, можно здесь сделать return.
+            # Поскольку это не команда, а просто текст, оставим без return.
 
         if self.check_timeout_and_reset(user_id, user):
             return
@@ -942,6 +946,31 @@ class VKBot:
         self.user_temp_data[user_id] = {'survey_answers': {}}
         update_user_state(user_id, 'q1')
         self.send_survey_question(user_id, 'q1')
+
+    # ---------- Методы для отложенных рассылок ----------
+    def send_promotion_to_all_subscribers(self, promotion_text):
+        """Отправляет промо-сообщение всем подписчикам."""
+        subscribers = get_subscribers()
+        if not subscribers:
+            logger.info("Нет подписчиков для отправки промо.")
+            return
+        for sub in subscribers:
+            self.send_message(sub['vk_id'], promotion_text)
+            time.sleep(0.1)  # небольшая задержка, чтобы не превысить лимиты
+
+    def schedule_promotions(self):
+        """Запускает таймеры для отложенных рассылок."""
+        # Первая рассылка через 10 секунд после запуска бота
+        timer1 = threading.Timer(10.0, self.send_promotion_to_all_subscribers, args=(PROMO_MESSAGE,))
+        timer1.daemon = True
+        timer1.start()
+        logger.info("Запланирована рассылка промо через 10 секунд.")
+
+        # Вторая рассылка через 7 дней (604800 секунд)
+        timer2 = threading.Timer(604800.0, self.send_promotion_to_all_subscribers, args=(PROMO_MESSAGE,))
+        timer2.daemon = True
+        timer2.start()
+        logger.info("Запланирована повторная рассылка промо через 7 дней.")
 
     # ============= АДМИНИСТРИРОВАНИЕ ========================================
     def process_admin_command(self, event):
@@ -1628,6 +1657,9 @@ class VKBot:
 def main():
     init_db()
     bot = VKBot(GROUP_ID, API_TOKEN)
+
+    # Запускаем отложенные рассылки
+    bot.schedule_promotions()
 
     mailing_thread = threading.Thread(target=bot.mailing_worker, daemon=True)
     mailing_thread.start()
