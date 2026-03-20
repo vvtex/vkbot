@@ -3,7 +3,7 @@
 
 """
 ВКонтакте бот для сбора потребностей в услугах по продвижению сайтов.
-Версия 3.8 (добавлена кнопка "Назад" в опрос)
+Версия 4.0 (опрос с интерактивными callback-кнопками)
 """
 
 import os
@@ -15,6 +15,7 @@ import time
 import csv
 import io
 import traceback
+import json
 from datetime import datetime, timedelta
 
 try:
@@ -445,50 +446,60 @@ def get_admin_keyboard():
 def get_empty_keyboard():
     return VkKeyboard.get_empty_keyboard()
 
-# ---- Клавиатуры для опроса (с поддержкой кнопки "Назад") ----
-def get_q1_keyboard():
-    kb = VkKeyboard(one_time=True)
-    kb.add_button('Да', color=VkKeyboardColor.POSITIVE)
-    kb.add_button('Нет', color=VkKeyboardColor.NEGATIVE)
-    return kb
+# ---- Inline-клавиатуры для опроса (с callback) ----
+def get_q1_inline_keyboard(selected=None):
+    kb = VkKeyboard(inline=True)
+    # Варианты: Да, Нет
+    for opt in ['Да', 'Нет']:
+        label = f"{opt}"
+        if selected == opt:
+            label = "✅ " + opt
+        kb.add_callback_button(label, color=VkKeyboardColor.PRIMARY, payload={"type": "survey", "q": "q1", "opt": opt})
+        kb.add_line()
+    kb.add_callback_button("➡️ Далее", color=VkKeyboardColor.POSITIVE, payload={"type": "survey", "q": "q1", "action": "next"})
+    return kb.get_keyboard()
 
-def get_q2_keyboard():
-    kb = VkKeyboard(one_time=True)
-    kb.add_button('Да', color=VkKeyboardColor.POSITIVE)
-    kb.add_button('Нет', color=VkKeyboardColor.NEGATIVE)
-    kb.add_line()
-    kb.add_button('Уже делали', color=VkKeyboardColor.PRIMARY)
-    kb.add_line()
-    kb.add_button('🔙 Назад', color=VkKeyboardColor.SECONDARY)
-    return kb
+def get_q2_inline_keyboard(selected=None):
+    kb = VkKeyboard(inline=True)
+    for opt in ['Да', 'Нет', 'Уже делали']:
+        label = f"{opt}"
+        if selected == opt:
+            label = "✅ " + opt
+        kb.add_callback_button(label, color=VkKeyboardColor.PRIMARY, payload={"type": "survey", "q": "q2", "opt": opt})
+        kb.add_line()
+    kb.add_callback_button("⬅️ Назад", color=VkKeyboardColor.SECONDARY, payload={"type": "survey", "q": "q2", "action": "back"})
+    kb.add_callback_button("➡️ Далее", color=VkKeyboardColor.POSITIVE, payload={"type": "survey", "q": "q2", "action": "next"})
+    return kb.get_keyboard()
 
-def get_q3_keyboard():
-    kb = VkKeyboard(one_time=True)
-    kb.add_button('Да', color=VkKeyboardColor.POSITIVE)
-    kb.add_button('Нет', color=VkKeyboardColor.NEGATIVE)
-    kb.add_line()
-    kb.add_button('Частично', color=VkKeyboardColor.PRIMARY)
-    kb.add_line()
-    kb.add_button('🔙 Назад', color=VkKeyboardColor.SECONDARY)
-    return kb
+def get_q3_inline_keyboard(selected=None):
+    kb = VkKeyboard(inline=True)
+    for opt in ['Да', 'Нет', 'Частично']:
+        label = f"{opt}"
+        if selected == opt:
+            label = "✅ " + opt
+        kb.add_callback_button(label, color=VkKeyboardColor.PRIMARY, payload={"type": "survey", "q": "q3", "opt": opt})
+        kb.add_line()
+    kb.add_callback_button("⬅️ Назад", color=VkKeyboardColor.SECONDARY, payload={"type": "survey", "q": "q3", "action": "back"})
+    kb.add_callback_button("➡️ Далее", color=VkKeyboardColor.POSITIVE, payload={"type": "survey", "q": "q3", "action": "next"})
+    return kb.get_keyboard()
 
-def get_q4_keyboard():
-    kb = VkKeyboard(one_time=True)
-    kb.add_button('Реклама', color=VkKeyboardColor.PRIMARY)
-    kb.add_button('Аудит', color=VkKeyboardColor.PRIMARY)
-    kb.add_line()
-    kb.add_button('Оба варианта', color=VkKeyboardColor.POSITIVE)
-    kb.add_line()
-    kb.add_button('🔙 Назад', color=VkKeyboardColor.SECONDARY)
-    return kb
+def get_q4_inline_keyboard(selected=None):
+    kb = VkKeyboard(inline=True)
+    for opt in ['Реклама', 'Аудит', 'Оба варианта']:
+        label = f"{opt}"
+        if selected == opt:
+            label = "✅ " + opt
+        kb.add_callback_button(label, color=VkKeyboardColor.PRIMARY, payload={"type": "survey", "q": "q4", "opt": opt})
+        kb.add_line()
+    kb.add_callback_button("⬅️ Назад", color=VkKeyboardColor.SECONDARY, payload={"type": "survey", "q": "q4", "action": "back"})
+    kb.add_callback_button("✅ Завершить", color=VkKeyboardColor.POSITIVE, payload={"type": "survey", "q": "q4", "action": "finish"})
+    return kb.get_keyboard()
 
-def get_subscribe_keyboard():
-    kb = VkKeyboard(one_time=True)
-    kb.add_button('Да', color=VkKeyboardColor.POSITIVE)
-    kb.add_button('Нет', color=VkKeyboardColor.NEGATIVE)
-    kb.add_line()
-    kb.add_button('🔙 Назад', color=VkKeyboardColor.SECONDARY)
-    return kb
+def get_subscribe_inline_keyboard():
+    kb = VkKeyboard(inline=True)
+    kb.add_callback_button("✅ Да", color=VkKeyboardColor.POSITIVE, payload={"type": "survey", "action": "subscribe_yes"})
+    kb.add_callback_button("❌ Нет", color=VkKeyboardColor.NEGATIVE, payload={"type": "survey", "action": "subscribe_no"})
+    return kb.get_keyboard()
 # ===========================================================================
 
 # ================== ОСНОВНОЙ КЛАСС БОТА ====================================
@@ -531,6 +542,20 @@ class VKBot:
         except Exception as e:
             logger.error(f"Неизвестная ошибка при отправке сообщения пользователю {user_id}: {e}")
 
+    def edit_message(self, user_id, message_id, message, keyboard=None):
+        """Редактирование сообщения (для inline-клавиатур)."""
+        try:
+            self.vk.messages.edit(
+                peer_id=user_id,
+                message_id=message_id,
+                message=message,
+                keyboard=keyboard
+            )
+        except ApiError as e:
+            logger.error(f"Ошибка при редактировании сообщения для пользователя {user_id}: {e}")
+        except Exception as e:
+            logger.error(f"Неизвестная ошибка при редактировании: {e}")
+
     def notify_admins(self, message, attachment=None):
         for admin_id in ADMIN_IDS:
             try:
@@ -570,9 +595,205 @@ class VKBot:
 
             if event.type == VkBotEventType.MESSAGE_NEW and event.from_user:
                 self.handle_message(event)
+            elif event.type == VkBotEventType.MESSAGE_EVENT:  # Обработка callback-кнопок
+                self.handle_message_event(event)
         except Exception as e:
             logger.error(f"Необработанное исключение в handle_event: {e}")
             logger.error(traceback.format_exc())
+
+    def handle_message_event(self, event):
+        """Обработка нажатий на inline-кнопки."""
+        user_id = event.object['user_id']
+        payload = event.object['payload']
+        # Получаем информацию о пользователе
+        user = get_or_create_user(user_id)
+
+        if is_user_blocked(user_id):
+            logger.info(f"Заблокированный пользователь {user_id} нажал кнопку. Игнорируем.")
+            return
+
+        # Проверяем тайм-аут
+        if self.check_timeout_and_reset(user_id, user):
+            return
+
+        # Обрабатываем payload
+        if payload.get('type') == 'survey':
+            self.handle_survey_callback(event, user, payload)
+
+    def handle_survey_callback(self, event, user, payload):
+        """Обработка callback от опроса."""
+        user_id = user['vk_id']
+        state = user['current_state']
+        # Если состояние не соответствует ожидаемому, игнорируем (или сбрасываем)
+        if not state or not state.startswith('q'):
+            logger.warning(f"Пользователь {user_id} нажал кнопку опроса, но состояние {state}")
+            # Можно отправить сообщение об ошибке
+            return
+
+        # Инициализируем временные данные, если нужно
+        if user_id not in self.user_temp_data:
+            self.user_temp_data[user_id] = {'survey_answers': {}}
+
+        current_q = state  # например 'q1'
+        # Если это выбор варианта
+        if 'opt' in payload:
+            selected_opt = payload['opt']
+            # Сохраняем выбранный вариант во временные данные
+            self.user_temp_data[user_id]['survey_answers'][current_q] = selected_opt
+            # Обновляем клавиатуру, отмечая выбранный вариант
+            new_kb = self.get_updated_keyboard(current_q, selected_opt)
+            # Редактируем сообщение, чтобы обновить кнопки
+            self.edit_message(
+                user_id,
+                event.object['conversation_message_id'],
+                event.object['message'],  # оставляем текст без изменений
+                keyboard=new_kb
+            )
+        # Обработка действий "next", "back", "finish"
+        elif 'action' in payload:
+            action = payload['action']
+            if action == 'next':
+                # Переходим к следующему вопросу, если выбран вариант
+                if current_q not in self.user_temp_data[user_id]['survey_answers']:
+                    # Вариант не выбран
+                    self.send_message(user_id, "Пожалуйста, сначала выберите один из вариантов.")
+                    return
+                # Сохраняем ответ в БД? Пока нет, сохраним в конце
+                # Меняем состояние
+                next_state = self.get_next_state(current_q)
+                if next_state:
+                    update_user_state(user_id, next_state)
+                    # Отправляем новый вопрос
+                    self.send_survey_question(user_id, next_state)
+                else:
+                    # Если следующего нет, возможно, завершение
+                    pass
+            elif action == 'back':
+                prev_state = self.get_prev_state(current_q)
+                if prev_state:
+                    # Удаляем ответ на текущий вопрос из временных данных
+                    if current_q in self.user_temp_data[user_id]['survey_answers']:
+                        del self.user_temp_data[user_id]['survey_answers'][current_q]
+                    update_user_state(user_id, prev_state)
+                    # Отправляем предыдущий вопрос
+                    self.send_survey_question(user_id, prev_state)
+                else:
+                    self.send_message(user_id, "Вы не можете вернуться назад.")
+            elif action == 'finish':
+                # Завершаем опрос, сохраняем все ответы, переходим к подписке
+                if current_q not in self.user_temp_data[user_id]['survey_answers']:
+                    self.send_message(user_id, "Пожалуйста, сначала выберите один из вариантов.")
+                    return
+                # Сохраняем последний ответ
+                # Теперь все ответы есть во временных данных
+                # Переходим к вопросу о подписке
+                update_user_state(user_id, 'subscribe')
+                self.send_subscribe_question(user_id)
+        elif 'action' in payload and payload['action'].startswith('subscribe_'):
+            # Обработка подписки
+            subscribed = (payload['action'] == 'subscribe_yes')
+            set_subscription(user_id, subscribed)
+
+            # Сохраняем все ответы из временных данных в БД
+            answers = self.user_temp_data[user_id].get('survey_answers', {})
+            # В answers ключи: q1, q2, q3, q4
+            question_map = {
+                'q1': 'Есть ли у вас сайт?',
+                'q2': 'Нужно ли провести аудит сайта?',
+                'q3': 'Требуется ли переделать контент?',
+                'q4': 'Вам нужна реклама или только аудит?'
+            }
+            for q_key, answer in answers.items():
+                if q_key in question_map:
+                    save_answer(user_id, question_map[q_key], answer)
+
+            # Отправляем админам
+            if answers:
+                emoji_map = {
+                    'Есть ли у вас сайт?': '🌐',
+                    'Нужно ли провести аудит сайта?': '🔍',
+                    'Требуется ли переделать контент?': '📝',
+                    'Вам нужна реклама или только аудит?': '📊'
+                }
+                answers_text = '\n'.join([
+                    f"{emoji_map.get(question_map[q], '•')} {question_map[q]}: {ans}"
+                    for q, ans in answers.items()
+                ])
+                admin_msg = (
+                    f"📝 **Новый опрос пройден**\n"
+                    f"👤 Пользователь: {user['first_name']} {user['last_name']} (id{user_id})\n"
+                    f"📋 **Ответы:**\n{answers_text}"
+                )
+                self.notify_admins(admin_msg)
+
+            # Очищаем временные данные
+            if user_id in self.user_temp_data:
+                del self.user_temp_data[user_id]
+
+            clear_user_state(user_id)
+            if subscribed:
+                msg = "🔔 Отлично! Вы подписались на акции. Будем присылать самое интересное."
+            else:
+                msg = "⏸️ Хорошо, если передумаете - всегда можете написать мне."
+            self.send_message(user_id, msg, get_empty_keyboard())
+            self.send_main_menu(user_id)
+
+    def get_updated_keyboard(self, q_state, selected_opt):
+        """Возвращает обновлённую клавиатуру для вопроса с отмеченным вариантом."""
+        if q_state == 'q1':
+            return get_q1_inline_keyboard(selected_opt)
+        elif q_state == 'q2':
+            return get_q2_inline_keyboard(selected_opt)
+        elif q_state == 'q3':
+            return get_q3_inline_keyboard(selected_opt)
+        elif q_state == 'q4':
+            return get_q4_inline_keyboard(selected_opt)
+        else:
+            return None
+
+    def send_survey_question(self, user_id, q_state):
+        """Отправляет вопрос с inline-клавиатурой."""
+        if q_state == 'q1':
+            msg = "🔹 **Вопрос 1 из 4**\nЕсть ли у вас сайт?"
+            kb = get_q1_inline_keyboard()
+        elif q_state == 'q2':
+            msg = "🔹 **Вопрос 2 из 4**\nНужно ли провести аудит сайта?"
+            kb = get_q2_inline_keyboard()
+        elif q_state == 'q3':
+            msg = "🔹 **Вопрос 3 из 4**\nТребуется ли переделать контент?"
+            kb = get_q3_inline_keyboard()
+        elif q_state == 'q4':
+            msg = "🔹 **Вопрос 4 из 4**\nВам нужна реклама или только аудит?"
+            kb = get_q4_inline_keyboard()
+        else:
+            return
+        self.send_message(user_id, msg, keyboard=kb)
+
+    def send_subscribe_question(self, user_id):
+        msg = ("✅ Спасибо за ответы! Мы свяжемся с вами в ближайшее время.\n\n"
+               "Хотите получать информацию о наших акциях?")
+        kb = get_subscribe_inline_keyboard()
+        self.send_message(user_id, msg, keyboard=kb)
+
+    def get_next_state(self, current_q):
+        states = ['q1', 'q2', 'q3', 'q4']
+        try:
+            idx = states.index(current_q)
+            if idx < len(states) - 1:
+                return states[idx + 1]
+        except ValueError:
+            pass
+        return None
+
+    def get_prev_state(self, current_q):
+        states = ['q1', 'q2', 'q3', 'q4']
+        try:
+            idx = states.index(current_q)
+            if idx > 0:
+                return states[idx - 1]
+        except ValueError:
+            pass
+        return None
 
     def handle_message(self, event):
         user_id = event.message['from_id']
@@ -610,10 +831,20 @@ class VKBot:
             self.process_admin_command(event)
             return
 
-        if user['current_state']:
-            self.handle_stateful_response(event, user)
+        # Если пользователь в состоянии опроса, но отправил текст (не callback) — игнорируем?
+        # Можно предложить использовать кнопки
+        if user['current_state'] and user['current_state'].startswith('q'):
+            self.send_message(user_id, "Пожалуйста, используйте кнопки для ответа.")
+            return
+        elif user['current_state'] == 'subscribe':
+            self.send_message(user_id, "Пожалуйста, используйте кнопки для ответа.")
             return
 
+        if user['current_state'] in ('request_name', 'request_phone', 'request_email'):
+            self.handle_request_response(event, user)
+            return
+
+        # Кнопки главного меню
         if text == '📢 Акции':
             self.show_promotions(user_id)
         elif text == '📝 Отправить заявку':
@@ -710,169 +941,11 @@ class VKBot:
             self.send_main_menu(user_id)
 
     def start_survey(self, user_id):
-        # Инициализируем временное хранилище для ответов
-        self.user_temp_data[user_id] = {'survey_answers': []}
+        """Начинаем опрос с inline-кнопками."""
+        # Инициализируем временные данные
+        self.user_temp_data[user_id] = {'survey_answers': {}}
         update_user_state(user_id, 'q1')
-        msg = "🔹 **Вопрос 1 из 4**\nЕсть ли у вас сайт?"
-        kb = get_q1_keyboard().get_keyboard()
-        self.send_message(user_id, msg, kb)
-
-    def handle_survey_response(self, event, user):
-        user_id = user['vk_id']
-        state = user['current_state']
-        text = event.message['text'].strip()
-
-        # Если временные данные отсутствуют, инициализируем (на случай сбоя)
-        if user_id not in self.user_temp_data or 'survey_answers' not in self.user_temp_data[user_id]:
-            self.user_temp_data[user_id] = {'survey_answers': []}
-
-        # Обработка кнопки "Назад"
-        if text == '🔙 Назад':
-            self.handle_survey_back(user_id, state)
-            return
-
-        # Обычный ответ на вопрос
-        if state == 'q1':
-            if text not in ['Да', 'Нет']:
-                self.send_message(user_id, "Пожалуйста, выберите один из вариантов на кнопках.")
-                return
-            # Сохраняем ответ временно
-            self.user_temp_data[user_id]['survey_answers'].append(('Есть ли у вас сайт?', text))
-            update_user_state(user_id, 'q2')
-            msg = "🔹 **Вопрос 2 из 4**\nНужно ли провести аудит сайта?"
-            kb = get_q2_keyboard().get_keyboard()
-            self.send_message(user_id, msg, kb)
-
-        elif state == 'q2':
-            if text not in ['Да', 'Нет', 'Уже делали']:
-                self.send_message(user_id, "Пожалуйста, выберите один из вариантов на кнопках.")
-                return
-            self.user_temp_data[user_id]['survey_answers'].append(('Нужно ли провести аудит сайта?', text))
-            update_user_state(user_id, 'q3')
-            msg = "🔹 **Вопрос 3 из 4**\nТребуется ли переделать контент?"
-            kb = get_q3_keyboard().get_keyboard()
-            self.send_message(user_id, msg, kb)
-
-        elif state == 'q3':
-            if text not in ['Да', 'Нет', 'Частично']:
-                self.send_message(user_id, "Пожалуйста, выберите один из вариантов на кнопках.")
-                return
-            self.user_temp_data[user_id]['survey_answers'].append(('Требуется ли переделать контент?', text))
-            update_user_state(user_id, 'q4')
-            msg = "🔹 **Вопрос 4 из 4**\nВам нужна реклама или только аудит?"
-            kb = get_q4_keyboard().get_keyboard()
-            self.send_message(user_id, msg, kb)
-
-        elif state == 'q4':
-            if text not in ['Реклама', 'Аудит', 'Оба варианта']:
-                self.send_message(user_id, "Пожалуйста, выберите один из вариантов на кнопках.")
-                return
-            self.user_temp_data[user_id]['survey_answers'].append(('Вам нужна реклама или только аудит?', text))
-            update_user_state(user_id, 'subscribe')
-            msg = ("✅ Спасибо за ответы! Мы свяжемся с вами в ближайшее время.\n\n"
-                   "Хотите получать информацию о наших акциях?")
-            kb = get_subscribe_keyboard().get_keyboard()
-            self.send_message(user_id, msg, kb)
-
-        elif state == 'subscribe':
-            if text not in ['Да', 'Нет']:
-                self.send_message(user_id, "Пожалуйста, выберите один из вариантов на кнопках.")
-                return
-            subscribed = (text == 'Да')
-            set_subscription(user_id, subscribed)
-
-            # Сохраняем все накопленные ответы в БД
-            answers = self.user_temp_data[user_id].get('survey_answers', [])
-            for question, answer in answers:
-                save_answer(user_id, question, answer)
-
-            # Отправляем администраторам результаты опроса
-            if answers:
-                emoji_map = {
-                    'Есть ли у вас сайт?': '🌐',
-                    'Нужно ли провести аудит сайта?': '🔍',
-                    'Требуется ли переделать контент?': '📝',
-                    'Вам нужна реклама или только аудит?': '📊'
-                }
-                answers_text = '\n'.join([
-                    f"{emoji_map.get(q, '•')} {q}: {a}" for q, a in answers
-                ])
-                admin_msg = (
-                    f"📝 **Новый опрос пройден**\n"
-                    f"👤 Пользователь: {user['first_name']} {user['last_name']} (id{user_id})\n"
-                    f"📋 **Ответы:**\n{answers_text}"
-                )
-                self.notify_admins(admin_msg)
-
-            # Очищаем временные данные
-            if user_id in self.user_temp_data:
-                del self.user_temp_data[user_id]
-
-            clear_user_state(user_id)
-            if subscribed:
-                msg = "🔔 Отлично! Вы подписались на акции. Будем присылать самое интересное."
-            else:
-                msg = "⏸️ Хорошо, если передумаете - всегда можете написать мне."
-            self.send_message(user_id, msg, get_empty_keyboard())
-            self.send_main_menu(user_id)
-
-    def handle_survey_back(self, user_id, current_state):
-        """Обработка нажатия кнопки 'Назад' в опросе."""
-        # Определяем предыдущее состояние
-        prev_state_map = {
-            'q2': 'q1',
-            'q3': 'q2',
-            'q4': 'q3',
-            'subscribe': 'q4'
-        }
-        if current_state not in prev_state_map:
-            # Для первого вопроса назад быть не должно, но на всякий случай
-            self.send_message(user_id, "Вы не можете вернуться назад.")
-            return
-
-        prev_state = prev_state_map[current_state]
-
-        # Удаляем последний ответ из временного хранилища
-        if user_id in self.user_temp_data and 'survey_answers' in self.user_temp_data[user_id]:
-            if self.user_temp_data[user_id]['survey_answers']:
-                removed = self.user_temp_data[user_id]['survey_answers'].pop()
-                logger.info(f"Пользователь {user_id} отменил ответ: {removed}")
-
-        # Обновляем состояние в БД
-        update_user_state(user_id, prev_state)
-
-        # Отправляем сообщение с предыдущим вопросом
-        if prev_state == 'q1':
-            msg = "🔹 **Вопрос 1 из 4**\nЕсть ли у вас сайт?"
-            kb = get_q1_keyboard().get_keyboard()
-        elif prev_state == 'q2':
-            msg = "🔹 **Вопрос 2 из 4**\nНужно ли провести аудит сайта?"
-            kb = get_q2_keyboard().get_keyboard()
-        elif prev_state == 'q3':
-            msg = "🔹 **Вопрос 3 из 4**\nТребуется ли переделать контент?"
-            kb = get_q3_keyboard().get_keyboard()
-        elif prev_state == 'q4':
-            msg = "🔹 **Вопрос 4 из 4**\nВам нужна реклама или только аудит?"
-            kb = get_q4_keyboard().get_keyboard()
-        else:
-            # На всякий случай
-            self.send_message(user_id, "Произошла ошибка. Возврат в меню.")
-            clear_user_state(user_id)
-            self.send_main_menu(user_id)
-            return
-
-        self.send_message(user_id, msg, kb)
-
-    def handle_stateful_response(self, event, user):
-        state = user['current_state']
-        if state.startswith('q') or state == 'subscribe':
-            self.handle_survey_response(event, user)
-        elif state in ('request_name', 'request_phone', 'request_email'):
-            self.handle_request_response(event, user)
-        else:
-            logger.warning(f"Неизвестное состояние {state}, сбрасываем")
-            clear_user_state(user['vk_id'])
-            self.send_main_menu(user['vk_id'])
+        self.send_survey_question(user_id, 'q1')
 
     # ============= АДМИНИСТРИРОВАНИЕ ========================================
     def process_admin_command(self, event):
