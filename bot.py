@@ -3,7 +3,7 @@
 
 """
 ВКонтакте бот для сбора потребностей в услугах по продвижению сайтов.
-Версия 4.0 (опрос с интерактивными callback-кнопками)
+Версия 4.1 (исправлена обработка callback-событий, добавлен сброс опроса)
 """
 
 import os
@@ -449,13 +449,13 @@ def get_empty_keyboard():
 # ---- Inline-клавиатуры для опроса (с callback) ----
 def get_q1_inline_keyboard(selected=None):
     kb = VkKeyboard(inline=True)
-    # Варианты: Да, Нет
     for opt in ['Да', 'Нет']:
         label = f"{opt}"
         if selected == opt:
             label = "✅ " + opt
         kb.add_callback_button(label, color=VkKeyboardColor.PRIMARY, payload={"type": "survey", "q": "q1", "opt": opt})
         kb.add_line()
+    # Кнопка "Далее" (но на первом вопросе нет "Назад")
     kb.add_callback_button("➡️ Далее", color=VkKeyboardColor.POSITIVE, payload={"type": "survey", "q": "q1", "action": "next"})
     return kb.get_keyboard()
 
@@ -467,7 +467,9 @@ def get_q2_inline_keyboard(selected=None):
             label = "✅ " + opt
         kb.add_callback_button(label, color=VkKeyboardColor.PRIMARY, payload={"type": "survey", "q": "q2", "opt": opt})
         kb.add_line()
+    # Две кнопки: Назад и Сброс (и Далее)
     kb.add_callback_button("⬅️ Назад", color=VkKeyboardColor.SECONDARY, payload={"type": "survey", "q": "q2", "action": "back"})
+    kb.add_callback_button("🔄 Сброс", color=VkKeyboardColor.NEGATIVE, payload={"type": "survey", "q": "q2", "action": "reset"})
     kb.add_callback_button("➡️ Далее", color=VkKeyboardColor.POSITIVE, payload={"type": "survey", "q": "q2", "action": "next"})
     return kb.get_keyboard()
 
@@ -480,6 +482,7 @@ def get_q3_inline_keyboard(selected=None):
         kb.add_callback_button(label, color=VkKeyboardColor.PRIMARY, payload={"type": "survey", "q": "q3", "opt": opt})
         kb.add_line()
     kb.add_callback_button("⬅️ Назад", color=VkKeyboardColor.SECONDARY, payload={"type": "survey", "q": "q3", "action": "back"})
+    kb.add_callback_button("🔄 Сброс", color=VkKeyboardColor.NEGATIVE, payload={"type": "survey", "q": "q3", "action": "reset"})
     kb.add_callback_button("➡️ Далее", color=VkKeyboardColor.POSITIVE, payload={"type": "survey", "q": "q3", "action": "next"})
     return kb.get_keyboard()
 
@@ -492,6 +495,7 @@ def get_q4_inline_keyboard(selected=None):
         kb.add_callback_button(label, color=VkKeyboardColor.PRIMARY, payload={"type": "survey", "q": "q4", "opt": opt})
         kb.add_line()
     kb.add_callback_button("⬅️ Назад", color=VkKeyboardColor.SECONDARY, payload={"type": "survey", "q": "q4", "action": "back"})
+    kb.add_callback_button("🔄 Сброс", color=VkKeyboardColor.NEGATIVE, payload={"type": "survey", "q": "q4", "action": "reset"})
     kb.add_callback_button("✅ Завершить", color=VkKeyboardColor.POSITIVE, payload={"type": "survey", "q": "q4", "action": "finish"})
     return kb.get_keyboard()
 
@@ -543,7 +547,7 @@ class VKBot:
             logger.error(f"Неизвестная ошибка при отправке сообщения пользователю {user_id}: {e}")
 
     def edit_message(self, user_id, message_id, message, keyboard=None):
-        """Редактирование сообщения (для inline-клавиатур)."""
+        """Безопасное редактирование сообщения."""
         try:
             self.vk.messages.edit(
                 peer_id=user_id,
@@ -552,9 +556,22 @@ class VKBot:
                 keyboard=keyboard
             )
         except ApiError as e:
-            logger.error(f"Ошибка при редактировании сообщения для пользователя {user_id}: {e}")
+            # Ошибка 901: сообщение уже было отредактировано или не найдено
+            if e.code != 901:
+                logger.error(f"Ошибка при редактировании сообщения для пользователя {user_id}: {e}")
         except Exception as e:
             logger.error(f"Неизвестная ошибка при редактировании: {e}")
+
+    def answer_callback(self, event):
+        """Отправляет подтверждение callback-события, чтобы убрать крутилку."""
+        try:
+            self.vk.messages.sendMessageEventAnswer(
+                event_id=event.object['event_id'],
+                user_id=event.object['user_id'],
+                peer_id=event.object['peer_id']
+            )
+        except Exception as e:
+            logger.error(f"Не удалось отправить ответ на callback: {e}")
 
     def notify_admins(self, message, attachment=None):
         for admin_id in ADMIN_IDS:
@@ -595,108 +612,98 @@ class VKBot:
 
             if event.type == VkBotEventType.MESSAGE_NEW and event.from_user:
                 self.handle_message(event)
-            elif event.type == VkBotEventType.MESSAGE_EVENT:  # Обработка callback-кнопок
+            elif event.type == VkBotEventType.MESSAGE_EVENT:
+                # Всегда отвечаем на callback, даже если произойдёт ошибка
+                self.answer_callback(event)
                 self.handle_message_event(event)
         except Exception as e:
             logger.error(f"Необработанное исключение в handle_event: {e}")
             logger.error(traceback.format_exc())
 
     def handle_message_event(self, event):
-        """Обработка нажатий на inline-кнопки."""
-        user_id = event.object['user_id']
-        payload = event.object['payload']
-        # Получаем информацию о пользователе
-        user = get_or_create_user(user_id)
+        """Обработка нажатий на inline-кнопки (безопасно)."""
+        try:
+            user_id = event.object['user_id']
+            payload = event.object['payload']
+            user = get_or_create_user(user_id)
 
-        if is_user_blocked(user_id):
-            logger.info(f"Заблокированный пользователь {user_id} нажал кнопку. Игнорируем.")
-            return
+            if is_user_blocked(user_id):
+                logger.info(f"Заблокированный пользователь {user_id} нажал кнопку. Игнорируем.")
+                return
 
-        # Проверяем тайм-аут
-        if self.check_timeout_and_reset(user_id, user):
-            return
+            if self.check_timeout_and_reset(user_id, user):
+                return
 
-        # Обрабатываем payload
-        if payload.get('type') == 'survey':
-            self.handle_survey_callback(event, user, payload)
+            if payload.get('type') == 'survey':
+                self.handle_survey_callback(event, user, payload)
+        except Exception as e:
+            logger.error(f"Ошибка в handle_message_event: {e}")
+            logger.error(traceback.format_exc())
 
     def handle_survey_callback(self, event, user, payload):
-        """Обработка callback от опроса."""
         user_id = user['vk_id']
         state = user['current_state']
-        # Если состояние не соответствует ожидаемому, игнорируем (или сбрасываем)
         if not state or not state.startswith('q'):
             logger.warning(f"Пользователь {user_id} нажал кнопку опроса, но состояние {state}")
-            # Можно отправить сообщение об ошибке
             return
 
         # Инициализируем временные данные, если нужно
         if user_id not in self.user_temp_data:
             self.user_temp_data[user_id] = {'survey_answers': {}}
 
-        current_q = state  # например 'q1'
+        current_q = state
         # Если это выбор варианта
         if 'opt' in payload:
             selected_opt = payload['opt']
-            # Сохраняем выбранный вариант во временные данные
             self.user_temp_data[user_id]['survey_answers'][current_q] = selected_opt
-            # Обновляем клавиатуру, отмечая выбранный вариант
             new_kb = self.get_updated_keyboard(current_q, selected_opt)
-            # Редактируем сообщение, чтобы обновить кнопки
             self.edit_message(
                 user_id,
                 event.object['conversation_message_id'],
-                event.object['message'],  # оставляем текст без изменений
+                event.object['message'],
                 keyboard=new_kb
             )
-        # Обработка действий "next", "back", "finish"
+        # Обработка действий "next", "back", "reset", "finish"
         elif 'action' in payload:
             action = payload['action']
             if action == 'next':
-                # Переходим к следующему вопросу, если выбран вариант
                 if current_q not in self.user_temp_data[user_id]['survey_answers']:
-                    # Вариант не выбран
                     self.send_message(user_id, "Пожалуйста, сначала выберите один из вариантов.")
                     return
-                # Сохраняем ответ в БД? Пока нет, сохраним в конце
-                # Меняем состояние
                 next_state = self.get_next_state(current_q)
                 if next_state:
                     update_user_state(user_id, next_state)
-                    # Отправляем новый вопрос
                     self.send_survey_question(user_id, next_state)
                 else:
-                    # Если следующего нет, возможно, завершение
+                    # Если следующего нет, возможно, завершение (но обычно finish)
                     pass
             elif action == 'back':
                 prev_state = self.get_prev_state(current_q)
                 if prev_state:
-                    # Удаляем ответ на текущий вопрос из временных данных
                     if current_q in self.user_temp_data[user_id]['survey_answers']:
                         del self.user_temp_data[user_id]['survey_answers'][current_q]
                     update_user_state(user_id, prev_state)
-                    # Отправляем предыдущий вопрос
                     self.send_survey_question(user_id, prev_state)
                 else:
                     self.send_message(user_id, "Вы не можете вернуться назад.")
+            elif action == 'reset':
+                # Полный сброс опроса
+                if user_id in self.user_temp_data:
+                    del self.user_temp_data[user_id]
+                clear_user_state(user_id)
+                self.start_survey(user_id)
             elif action == 'finish':
-                # Завершаем опрос, сохраняем все ответы, переходим к подписке
                 if current_q not in self.user_temp_data[user_id]['survey_answers']:
                     self.send_message(user_id, "Пожалуйста, сначала выберите один из вариантов.")
                     return
-                # Сохраняем последний ответ
-                # Теперь все ответы есть во временных данных
-                # Переходим к вопросу о подписке
                 update_user_state(user_id, 'subscribe')
                 self.send_subscribe_question(user_id)
         elif 'action' in payload and payload['action'].startswith('subscribe_'):
-            # Обработка подписки
             subscribed = (payload['action'] == 'subscribe_yes')
             set_subscription(user_id, subscribed)
 
-            # Сохраняем все ответы из временных данных в БД
+            # Сохраняем все ответы в БД
             answers = self.user_temp_data[user_id].get('survey_answers', {})
-            # В answers ключи: q1, q2, q3, q4
             question_map = {
                 'q1': 'Есть ли у вас сайт?',
                 'q2': 'Нужно ли провести аудит сайта?',
@@ -707,7 +714,6 @@ class VKBot:
                 if q_key in question_map:
                     save_answer(user_id, question_map[q_key], answer)
 
-            # Отправляем админам
             if answers:
                 emoji_map = {
                     'Есть ли у вас сайт?': '🌐',
@@ -726,10 +732,8 @@ class VKBot:
                 )
                 self.notify_admins(admin_msg)
 
-            # Очищаем временные данные
             if user_id in self.user_temp_data:
                 del self.user_temp_data[user_id]
-
             clear_user_state(user_id)
             if subscribed:
                 msg = "🔔 Отлично! Вы подписались на акции. Будем присылать самое интересное."
@@ -739,7 +743,6 @@ class VKBot:
             self.send_main_menu(user_id)
 
     def get_updated_keyboard(self, q_state, selected_opt):
-        """Возвращает обновлённую клавиатуру для вопроса с отмеченным вариантом."""
         if q_state == 'q1':
             return get_q1_inline_keyboard(selected_opt)
         elif q_state == 'q2':
@@ -748,11 +751,9 @@ class VKBot:
             return get_q3_inline_keyboard(selected_opt)
         elif q_state == 'q4':
             return get_q4_inline_keyboard(selected_opt)
-        else:
-            return None
+        return None
 
     def send_survey_question(self, user_id, q_state):
-        """Отправляет вопрос с inline-клавиатурой."""
         if q_state == 'q1':
             msg = "🔹 **Вопрос 1 из 4**\nЕсть ли у вас сайт?"
             kb = get_q1_inline_keyboard()
@@ -831,8 +832,6 @@ class VKBot:
             self.process_admin_command(event)
             return
 
-        # Если пользователь в состоянии опроса, но отправил текст (не callback) — игнорируем?
-        # Можно предложить использовать кнопки
         if user['current_state'] and user['current_state'].startswith('q'):
             self.send_message(user_id, "Пожалуйста, используйте кнопки для ответа.")
             return
@@ -844,7 +843,6 @@ class VKBot:
             self.handle_request_response(event, user)
             return
 
-        # Кнопки главного меню
         if text == '📢 Акции':
             self.show_promotions(user_id)
         elif text == '📝 Отправить заявку':
@@ -941,8 +939,6 @@ class VKBot:
             self.send_main_menu(user_id)
 
     def start_survey(self, user_id):
-        """Начинаем опрос с inline-кнопками."""
-        # Инициализируем временные данные
         self.user_temp_data[user_id] = {'survey_answers': {}}
         update_user_state(user_id, 'q1')
         self.send_survey_question(user_id, 'q1')
