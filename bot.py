@@ -1,21 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-ВКонтакте бот для сбора потребностей в услугах по продвижению сайтов.
-Версия 4.3 (добавлены отложенные рассылки и триггер по фразе "скидка 10 процентов")
-"""
-
 import os
 import sys
 import sqlite3
 import logging
 import threading
 import time
-import csv
-import io
 import traceback
-import json
 from datetime import datetime, timedelta
 
 try:
@@ -26,20 +18,23 @@ try:
     from vk_api import VkUpload
     from vk_api.exceptions import ApiError
 except ImportError:
-    print("="*60)
-    print("ОШИБКА: не установлена библиотека vk_api.")
-    print("Установите её командой: pip install vk-api")
-    print("="*60)
+    print("Установите vk-api: pip install vk-api")
     sys.exit(1)
 
+# Импортируем классы ботов
+from bots import (
+    SurveyBot,
+    HairdresserBot,
+    SepticBot,
+    RoofBot,
+    BankruptcyBot,
+    ValuationBot,
+)
+
 # ================== НАСТРОЙКА ЛОГИРОВАНИЯ ==================================
-DATA_DIR = os.getenv('DATA_DIR', '.').rstrip('/')
+DATA_DIR = os.getenv('DATA_DIR', '.')
 if not os.path.exists(DATA_DIR):
-    try:
-        os.makedirs(DATA_DIR)
-    except Exception as e:
-        print(f"Не удалось создать директорию {DATA_DIR}: {e}")
-        sys.exit(1)
+    os.makedirs(DATA_DIR, exist_ok=True)
 
 log_file = os.path.join(DATA_DIR, 'bot.log')
 logging.basicConfig(
@@ -51,60 +46,36 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger('VK_bot')
-# ===========================================================================
 
 # ================== КОНФИГУРАЦИЯ ===========================================
 GROUP_ID_STR = os.getenv('GROUP_ID')
 API_TOKEN = os.getenv('API_TOKEN')
 admin_ids_str = os.getenv('ADMIN_IDS')
 
-if not GROUP_ID_STR:
-    logger.error("Переменная окружения GROUP_ID не задана.")
-    sys.exit(1)
-if not API_TOKEN:
-    logger.error("Переменная окружения API_TOKEN не задана.")
-    sys.exit(1)
-if not admin_ids_str:
-    logger.error("Переменная окружения ADMIN_IDS не задана.")
+if not GROUP_ID_STR or not API_TOKEN or not admin_ids_str:
+    logger.error("Не заданы переменные окружения: GROUP_ID, API_TOKEN, ADMIN_IDS")
     sys.exit(1)
 
 def parse_group_id(group_id_str):
     if group_id_str.startswith('club'):
         return int(group_id_str[4:])
-    else:
-        return int(group_id_str)
+    return int(group_id_str)
 
-try:
-    GROUP_ID = parse_group_id(GROUP_ID_STR)
-except ValueError:
-    logger.error("GROUP_ID должен быть числом или строкой вида club<число>.")
-    sys.exit(1)
+GROUP_ID = parse_group_id(GROUP_ID_STR)
 
 ADMIN_IDS = []
 for part in admin_ids_str.split(','):
     part = part.strip()
     if part.isdigit():
         ADMIN_IDS.append(int(part))
-    else:
-        logger.warning(f"Некорректный ID администратора пропущен: {part}")
-
 if not ADMIN_IDS:
-    logger.error("Список ADMIN_IDS пуст или не содержит корректных ID.")
+    logger.error("Список ADMIN_IDS пуст")
     sys.exit(1)
 
 DB_FILE = os.getenv('DB_FILE', os.path.join(DATA_DIR, 'bot_database.db'))
-DEFAULT_MAILING_TIME = os.getenv('DEFAULT_MAILING_TIME', '10:00')
-MAILING_CHECK_INTERVAL = int(os.getenv('MAILING_CHECK_INTERVAL', '60'))
-
 BOT_ENABLED = True
 BOT_DISABLED_UNTIL = None
-TIMEOUT_MINUTES = 10  # тайм-аут неактивности пользователя (в минутах)
-USERS_PER_PAGE = 10   # количество пользователей на странице в списке
-
-# Константы для отложенных рассылок
-PROMO_MESSAGE = "🎁 **Специальное предложение!**\n\nСкидка 10% на все услуги по промокоду: **BOT10**\nДействует до конца месяца!"
-PROMO_TRIGGER_PHRASE = "скидка 10 процентов"
-# ===========================================================================
+TIMEOUT_MINUTES = 10
 
 # ================== РАБОТА С БАЗОЙ ДАННЫХ ==================================
 def init_db():
@@ -120,12 +91,17 @@ def init_db():
             last_interaction DATETIME DEFAULT CURRENT_TIMESTAMP,
             subscribed BOOLEAN DEFAULT 0,
             current_state TEXT,
-            is_blocked BOOLEAN DEFAULT 0
+            is_blocked BOOLEAN DEFAULT 0,
+            bot_name TEXT
         )
     ''')
     try:
         cur.execute('ALTER TABLE users ADD COLUMN is_blocked BOOLEAN DEFAULT 0')
-    except sqlite3.OperationalError:
+    except:
+        pass
+    try:
+        cur.execute('ALTER TABLE users ADD COLUMN bot_name TEXT')
+    except:
         pass
 
     cur.execute('''
@@ -149,29 +125,6 @@ def init_db():
         )
     ''')
     cur.execute('''
-        CREATE TABLE IF NOT EXISTS promotions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            text TEXT NOT NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            start_date DATE NOT NULL,
-            end_date DATE NOT NULL,
-            is_active BOOLEAN DEFAULT 1,
-            periodicity TEXT CHECK(periodicity IN ('daily', 'weekly')) DEFAULT 'daily',
-            last_sent DATETIME
-        )
-    ''')
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS sent_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            promotion_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            sent_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (promotion_id) REFERENCES promotions (id) ON DELETE CASCADE,
-            FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
-        )
-    ''')
-    cur.execute('''
         CREATE TABLE IF NOT EXISTS admin_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             admin_vk_id INTEGER NOT NULL,
@@ -182,7 +135,7 @@ def init_db():
     ''')
     conn.commit()
     conn.close()
-    logger.info("База данных инициализирована. Файл: %s", DB_FILE)
+    logger.info("База данных инициализирована")
 
 def get_db_connection():
     conn = sqlite3.connect(DB_FILE)
@@ -214,18 +167,24 @@ def get_or_create_user(vk_id, first_name='', last_name=''):
             'last_name': last_name,
             'subscribed': 0,
             'current_state': None,
-            'is_blocked': 0
+            'is_blocked': 0,
+            'bot_name': None
         }
 
-def update_user_state(vk_id, state):
+def update_user_state(vk_id, state, bot_name=None):
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute('UPDATE users SET current_state = ?, last_interaction = CURRENT_TIMESTAMP WHERE vk_id = ?', (state, vk_id))
+    if bot_name is not None:
+        cur.execute('UPDATE users SET current_state = ?, bot_name = ?, last_interaction = CURRENT_TIMESTAMP WHERE vk_id = ?',
+                    (state, bot_name, vk_id))
+    else:
+        cur.execute('UPDATE users SET current_state = ?, last_interaction = CURRENT_TIMESTAMP WHERE vk_id = ?',
+                    (state, vk_id))
     conn.commit()
     conn.close()
 
 def clear_user_state(vk_id):
-    update_user_state(vk_id, None)
+    update_user_state(vk_id, None, None)
 
 def save_answer(vk_id, question, answer):
     user = get_or_create_user(vk_id)
@@ -233,13 +192,6 @@ def save_answer(vk_id, question, answer):
     cur = conn.cursor()
     cur.execute('INSERT INTO survey_answers (user_id, question, answer) VALUES (?, ?, ?)',
                 (user['id'], question, answer))
-    conn.commit()
-    conn.close()
-
-def set_subscription(vk_id, subscribed):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('UPDATE users SET subscribed = ? WHERE vk_id = ?', (1 if subscribed else 0, vk_id))
     conn.commit()
     conn.close()
 
@@ -264,137 +216,13 @@ def log_admin_action(admin_vk_id, action, details=''):
     conn.commit()
     conn.close()
 
-def add_promotion(title, text, start_date, end_date, periodicity='daily'):
+def is_user_blocked(vk_id):
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute('''
-        INSERT INTO promotions (title, text, start_date, end_date, periodicity, is_active)
-        VALUES (?, ?, ?, ?, ?, 1)
-    ''', (title, text, start_date, end_date, periodicity))
-    conn.commit()
-    promo_id = cur.lastrowid
-    conn.close()
-    return promo_id
-
-def get_active_promotions():
-    today = datetime.now().date().isoformat()
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('''
-        SELECT * FROM promotions
-        WHERE is_active = 1 AND start_date <= ? AND end_date >= ?
-        ORDER BY created_at DESC
-    ''', (today, today))
-    rows = cur.fetchall()
-    conn.close()
-    return [dict(row) for row in rows]
-
-def get_all_promotions():
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('SELECT * FROM promotions ORDER BY created_at DESC')
-    rows = cur.fetchall()
-    conn.close()
-    return [dict(row) for row in rows]
-
-def get_promotion(promo_id):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('SELECT * FROM promotions WHERE id = ?', (promo_id,))
+    cur.execute('SELECT is_blocked FROM users WHERE vk_id = ?', (vk_id,))
     row = cur.fetchone()
     conn.close()
-    return dict(row) if row else None
-
-def update_promotion(promo_id, **kwargs):
-    allowed = {'title', 'text', 'start_date', 'end_date', 'is_active', 'periodicity', 'last_sent'}
-    updates = {k: v for k, v in kwargs.items() if k in allowed}
-    if not updates:
-        return
-    set_clause = ', '.join([f"{k} = ?" for k in updates.keys()])
-    values = list(updates.values()) + [promo_id]
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(f'UPDATE promotions SET {set_clause} WHERE id = ?', values)
-    conn.commit()
-    conn.close()
-
-def delete_promotion(promo_id):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('DELETE FROM promotions WHERE id = ?', (promo_id,))
-    conn.commit()
-    conn.close()
-
-def get_subscribers():
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('SELECT id, vk_id FROM users WHERE subscribed = 1 AND is_blocked = 0')
-    rows = cur.fetchall()
-    conn.close()
-    return [dict(row) for row in rows]
-
-def log_sent(promo_id, user_id):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('INSERT INTO sent_log (promotion_id, user_id) VALUES (?, ?)', (promo_id, user_id))
-    conn.commit()
-    conn.close()
-
-def was_sent_today(promo_id, user_id):
-    today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('''
-        SELECT 1 FROM sent_log
-        WHERE promotion_id = ? AND user_id = ? AND sent_at >= ?
-    ''', (promo_id, user_id, today_start))
-    result = cur.fetchone() is not None
-    conn.close()
-    return result
-
-def was_sent_this_week(promo_id, user_id):
-    now = datetime.now()
-    week_start = now - timedelta(days=now.weekday())
-    week_start = week_start.replace(hour=0, minute=0, second=0, microsecond=0)
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('''
-        SELECT 1 FROM sent_log
-        WHERE promotion_id = ? AND user_id = ? AND sent_at >= ?
-    ''', (promo_id, user_id, week_start))
-    result = cur.fetchone() is not None
-    conn.close()
-    return result
-
-# ---------- Функции для управления пользователями ----------
-def get_users_page(page=1, per_page=USERS_PER_PAGE):
-    offset = (page - 1) * per_page
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('''
-        SELECT vk_id, first_name, last_name, subscribed, is_blocked, last_interaction
-        FROM users
-        ORDER BY last_interaction DESC
-        LIMIT ? OFFSET ?
-    ''', (per_page, offset))
-    rows = cur.fetchall()
-    conn.close()
-    return [dict(row) for row in rows]
-
-def get_total_users():
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('SELECT COUNT(*) as cnt FROM users')
-    cnt = cur.fetchone()['cnt']
-    conn.close()
-    return cnt
-
-def update_subscription_admin(vk_id, subscribed):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('UPDATE users SET subscribed = ? WHERE vk_id = ?', (1 if subscribed else 0, vk_id))
-    conn.commit()
-    conn.close()
+    return row and row['is_blocked'] == 1
 
 def set_user_block(vk_id, block=True):
     conn = get_db_connection()
@@ -405,108 +233,38 @@ def set_user_block(vk_id, block=True):
     conn.commit()
     conn.close()
 
-def is_user_blocked(vk_id):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('SELECT is_blocked FROM users WHERE vk_id = ?', (vk_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row and row['is_blocked'] == 1
-# ===========================================================================
-
 # ================== КЛАВИАТУРЫ =============================================
 def get_main_menu_keyboard():
     kb = VkKeyboard(one_time=False)
     kb.add_button('📢 Акции', color=VkKeyboardColor.PRIMARY)
     kb.add_button('📝 Отправить заявку', color=VkKeyboardColor.PRIMARY)
-    kb.add_button('❓ Пройти опрос', color=VkKeyboardColor.PRIMARY)
+    kb.add_button('🤖 Боты', color=VkKeyboardColor.PRIMARY)
     return kb.get_keyboard()
 
-def get_admin_keyboard():
-    kb = VkKeyboard(one_time=False, inline=False)
-    kb.add_button('📊 Статистика', color=VkKeyboardColor.PRIMARY)
-    kb.add_button('📋 Ответы', color=VkKeyboardColor.PRIMARY)
-    kb.add_button('📤 Экспорт данных', color=VkKeyboardColor.PRIMARY)
-    kb.add_line()
-    kb.add_button('➕ Добавить акцию', color=VkKeyboardColor.POSITIVE)
-    kb.add_button('📋 Список акций', color=VkKeyboardColor.PRIMARY)
-    kb.add_button('✏️ Редактировать акцию', color=VkKeyboardColor.PRIMARY)
-    kb.add_line()
-    kb.add_button('❌ Удалить акцию', color=VkKeyboardColor.NEGATIVE)
-    kb.add_button('📨 Разослать акцию', color=VkKeyboardColor.POSITIVE)
-    kb.add_button('⏰ Установить время', color=VkKeyboardColor.PRIMARY)
-    kb.add_line()
-    kb.add_button('👥 Пользователи', color=VkKeyboardColor.PRIMARY)
-    kb.add_button('🔒 Блокировка', color=VkKeyboardColor.NEGATIVE)
-    kb.add_button('📧 Подписки', color=VkKeyboardColor.POSITIVE)
-    kb.add_line()
-    kb.add_button('💬 Ответить пользователю', color=VkKeyboardColor.PRIMARY)
-    kb.add_button('🚫 Отключить бота', color=VkKeyboardColor.NEGATIVE)
-    kb.add_button('✅ Включить бота', color=VkKeyboardColor.POSITIVE)
-    kb.add_line()
-    kb.add_button('🔙 Главное меню', color=VkKeyboardColor.SECONDARY)
+def get_bots_menu_keyboard():
+    kb = VkKeyboard(one_time=False, inline=True)
+    bots = [
+        ("📋 Опрос по продвижению", "bot_survey"),
+        ("💇 Запись в парикмахерскую", "bot_hairdresser"),
+        ("🚰 Септик и откачка", "bot_septic"),
+        ("🏠 Замер кровли и стройматериалы", "bot_roof"),
+        ("⚖️ Банкротство", "bot_bankruptcy"),
+        ("📊 Независимая оценка", "bot_valuation"),
+    ]
+    for name, payload in bots:
+        kb.add_callback_button(name, color=VkKeyboardColor.PRIMARY, payload={"type": "select_bot", "bot": payload})
+        kb.add_line()
+    kb.add_callback_button("🔙 Назад", color=VkKeyboardColor.SECONDARY, payload={"type": "main_menu"})
+    return kb.get_keyboard()
+
+def get_yes_no_keyboard():
+    kb = VkKeyboard(inline=True)
+    kb.add_callback_button("Да", color=VkKeyboardColor.POSITIVE, payload={"type": "consent", "answer": "yes"})
+    kb.add_callback_button("Нет", color=VkKeyboardColor.NEGATIVE, payload={"type": "consent", "answer": "no"})
     return kb.get_keyboard()
 
 def get_empty_keyboard():
     return VkKeyboard.get_empty_keyboard()
-
-# ---- Inline-клавиатуры для опроса (с callback) ----
-def get_q1_inline_keyboard(selected=None):
-    kb = VkKeyboard(inline=True)
-    for opt in ['Да', 'Нет']:
-        label = f"{opt}"
-        if selected == opt:
-            label = "✅ " + opt
-        kb.add_callback_button(label, color=VkKeyboardColor.PRIMARY, payload={"type": "survey", "q": "q1", "opt": opt})
-        kb.add_line()
-    kb.add_callback_button("➡️ Далее", color=VkKeyboardColor.POSITIVE, payload={"type": "survey", "q": "q1", "action": "next"})
-    return kb.get_keyboard()
-
-def get_q2_inline_keyboard(selected=None):
-    kb = VkKeyboard(inline=True)
-    for opt in ['Да', 'Нет', 'Уже делали']:
-        label = f"{opt}"
-        if selected == opt:
-            label = "✅ " + opt
-        kb.add_callback_button(label, color=VkKeyboardColor.PRIMARY, payload={"type": "survey", "q": "q2", "opt": opt})
-        kb.add_line()
-    kb.add_callback_button("⬅️ Назад", color=VkKeyboardColor.SECONDARY, payload={"type": "survey", "q": "q2", "action": "back"})
-    kb.add_callback_button("🔄 Сброс", color=VkKeyboardColor.NEGATIVE, payload={"type": "survey", "q": "q2", "action": "reset"})
-    kb.add_callback_button("➡️ Далее", color=VkKeyboardColor.POSITIVE, payload={"type": "survey", "q": "q2", "action": "next"})
-    return kb.get_keyboard()
-
-def get_q3_inline_keyboard(selected=None):
-    kb = VkKeyboard(inline=True)
-    for opt in ['Да', 'Нет', 'Частично']:
-        label = f"{opt}"
-        if selected == opt:
-            label = "✅ " + opt
-        kb.add_callback_button(label, color=VkKeyboardColor.PRIMARY, payload={"type": "survey", "q": "q3", "opt": opt})
-        kb.add_line()
-    kb.add_callback_button("⬅️ Назад", color=VkKeyboardColor.SECONDARY, payload={"type": "survey", "q": "q3", "action": "back"})
-    kb.add_callback_button("🔄 Сброс", color=VkKeyboardColor.NEGATIVE, payload={"type": "survey", "q": "q3", "action": "reset"})
-    kb.add_callback_button("➡️ Далее", color=VkKeyboardColor.POSITIVE, payload={"type": "survey", "q": "q3", "action": "next"})
-    return kb.get_keyboard()
-
-def get_q4_inline_keyboard(selected=None):
-    kb = VkKeyboard(inline=True)
-    for opt in ['Реклама', 'Аудит', 'Оба варианта']:
-        label = f"{opt}"
-        if selected == opt:
-            label = "✅ " + opt
-        kb.add_callback_button(label, color=VkKeyboardColor.PRIMARY, payload={"type": "survey", "q": "q4", "opt": opt})
-        kb.add_line()
-    kb.add_callback_button("⬅️ Назад", color=VkKeyboardColor.SECONDARY, payload={"type": "survey", "q": "q4", "action": "back"})
-    kb.add_callback_button("🔄 Сброс", color=VkKeyboardColor.NEGATIVE, payload={"type": "survey", "q": "q4", "action": "reset"})
-    kb.add_callback_button("✅ Завершить", color=VkKeyboardColor.POSITIVE, payload={"type": "survey", "q": "q4", "action": "finish"})
-    return kb.get_keyboard()
-
-def get_subscribe_inline_keyboard():
-    kb = VkKeyboard(inline=True)
-    kb.add_callback_button("✅ Да", color=VkKeyboardColor.POSITIVE, payload={"type": "survey", "action": "subscribe_yes"})
-    kb.add_callback_button("❌ Нет", color=VkKeyboardColor.NEGATIVE, payload={"type": "survey", "action": "subscribe_no"})
-    return kb.get_keyboard()
-# ===========================================================================
 
 # ================== ОСНОВНОЙ КЛАСС БОТА ====================================
 class VKBot:
@@ -516,11 +274,8 @@ class VKBot:
         self.vk_session = vk_api.VkApi(token=token)
         try:
             self.longpoll = VkBotLongPoll(self.vk_session, group_id)
-        except vk_api.exceptions.ApiError as e:
-            if "longpoll for this group is not enabled" in str(e):
-                logger.error("Ошибка: Long Poll API не включён для этого сообщества.")
-            else:
-                logger.error(f"Ошибка при инициализации LongPoll: {e}")
+        except Exception as e:
+            logger.error(f"Ошибка при инициализации LongPoll: {e}")
             sys.exit(1)
 
         self.vk = self.vk_session.get_api()
@@ -528,8 +283,18 @@ class VKBot:
         self.enabled = BOT_ENABLED
         self.disabled_until = BOT_DISABLED_UNTIL
 
-        self.admin_states = {}
+        # Словарь для временных данных (например, для выбора бота)
         self.user_temp_data = {}
+
+        # Регистрируем доступные боты
+        self.bots = {
+            "bot_survey": SurveyBot,
+            "bot_hairdresser": HairdresserBot,
+            "bot_septic": SepticBot,
+            "bot_roof": RoofBot,
+            "bot_bankruptcy": BankruptcyBot,
+            "bot_valuation": ValuationBot,
+        }
 
     def send_message(self, user_id, message, keyboard=None, attachment=None):
         try:
@@ -542,11 +307,11 @@ class VKBot:
             )
         except ApiError as e:
             if e.code in [901, 404406378]:
-                logger.warning(f"Не удалось отправить сообщение пользователю {user_id}: {e} (код {e.code})")
+                logger.warning(f"Не удалось отправить сообщение {user_id}: {e}")
             else:
-                logger.error(f"Ошибка VK API при отправке сообщения пользователю {user_id}: {e}")
+                logger.error(f"Ошибка отправки {user_id}: {e}")
         except Exception as e:
-            logger.error(f"Неизвестная ошибка при отправке сообщения пользователю {user_id}: {e}")
+            logger.error(f"Неизвестная ошибка: {e}")
 
     def edit_message(self, user_id, message_id, message_text, keyboard=None):
         try:
@@ -556,11 +321,8 @@ class VKBot:
                 message=message_text,
                 keyboard=keyboard
             )
-        except ApiError as e:
-            if e.code != 901:
-                logger.error(f"Ошибка при редактировании сообщения для пользователя {user_id}: {e}")
         except Exception as e:
-            logger.error(f"Неизвестная ошибка при редактировании: {e}")
+            logger.error(f"Ошибка редактирования: {e}")
 
     def answer_callback(self, event):
         try:
@@ -570,33 +332,16 @@ class VKBot:
                 peer_id=event.object['peer_id']
             )
         except Exception as e:
-            logger.error(f"Не удалось отправить ответ на callback: {e}")
+            logger.error(f"Ошибка ответа callback: {e}")
 
     def notify_admins(self, message, attachment=None):
         for admin_id in ADMIN_IDS:
-            try:
-                self.send_message(admin_id, message, attachment=attachment)
-            except Exception as e:
-                logger.error(f"Не удалось уведомить администратора {admin_id}: {e}")
+            self.send_message(admin_id, message, attachment=attachment)
 
     def is_bot_disabled(self):
         if not self.enabled:
             return True
         if self.disabled_until and datetime.now() < self.disabled_until:
-            return True
-        return False
-
-    def check_timeout_and_reset(self, user_id, user):
-        if not user['current_state']:
-            return False
-        last_interaction = datetime.strptime(user['last_interaction'], '%Y-%m-%d %H:%M:%S')
-        if datetime.now() - last_interaction > timedelta(minutes=TIMEOUT_MINUTES):
-            logger.info(f"Тайм-аут для пользователя {user_id}, сбрасываем состояние.")
-            if user_id in self.user_temp_data:
-                del self.user_temp_data[user_id]
-            clear_user_state(user_id)
-            self.send_message(user_id, "⏳ Время ожидания истекло. Возвращаю в главное меню.")
-            self.send_main_menu(user_id)
             return True
         return False
 
@@ -613,1065 +358,184 @@ class VKBot:
                 self.handle_message(event)
             elif event.type == VkBotEventType.MESSAGE_EVENT:
                 self.answer_callback(event)
-                self.handle_message_event(event)
+                self.handle_callback(event)
         except Exception as e:
-            logger.error(f"Необработанное исключение в handle_event: {e}")
+            logger.error(f"Необработанное исключение: {e}")
             logger.error(traceback.format_exc())
-
-    def handle_message_event(self, event):
-        try:
-            user_id = event.object['user_id']
-            payload = event.object['payload']
-            user = get_or_create_user(user_id)
-
-            if is_user_blocked(user_id):
-                logger.info(f"Заблокированный пользователь {user_id} нажал кнопку. Игнорируем.")
-                return
-
-            if self.check_timeout_and_reset(user_id, user):
-                return
-
-            if payload.get('type') == 'survey':
-                self.handle_survey_callback(event, user, payload)
-        except Exception as e:
-            logger.error(f"Ошибка в handle_message_event: {e}")
-            logger.error(traceback.format_exc())
-
-    def handle_survey_callback(self, event, user, payload):
-        user_id = user['vk_id']
-        state = user['current_state']
-
-        if not state or not state.startswith('q'):
-            logger.warning(f"Пользователь {user_id} нажал кнопку опроса, но состояние {state}. Игнорируем.")
-            return
-
-        if user_id not in self.user_temp_data:
-            self.user_temp_data[user_id] = {'survey_answers': {}}
-
-        current_q = state
-
-        if 'opt' in payload:
-            selected_opt = payload['opt']
-            self.user_temp_data[user_id]['survey_answers'][current_q] = selected_opt
-            new_kb = self.get_updated_keyboard(current_q, selected_opt)
-            message_text = event.object.get('message', '')
-            self.edit_message(
-                user_id,
-                event.object['conversation_message_id'],
-                message_text,
-                keyboard=new_kb
-            )
-        elif 'action' in payload:
-            action = payload['action']
-            if action == 'next':
-                if current_q not in self.user_temp_data[user_id]['survey_answers']:
-                    self.send_message(user_id, "Пожалуйста, сначала выберите один из вариантов.")
-                    return
-                next_state = self.get_next_state(current_q)
-                if next_state:
-                    update_user_state(user_id, next_state)
-                    self.send_survey_question(user_id, next_state)
-            elif action == 'back':
-                prev_state = self.get_prev_state(current_q)
-                if prev_state:
-                    if current_q in self.user_temp_data[user_id]['survey_answers']:
-                        del self.user_temp_data[user_id]['survey_answers'][current_q]
-                    update_user_state(user_id, prev_state)
-                    self.send_survey_question(user_id, prev_state)
-                else:
-                    self.send_message(user_id, "Вы не можете вернуться назад.")
-            elif action == 'reset':
-                if user_id in self.user_temp_data:
-                    del self.user_temp_data[user_id]
-                clear_user_state(user_id)
-                self.start_survey(user_id)
-            elif action == 'finish':
-                if current_q not in self.user_temp_data[user_id]['survey_answers']:
-                    self.send_message(user_id, "Пожалуйста, сначала выберите один из вариантов.")
-                    return
-                update_user_state(user_id, 'subscribe')
-                self.send_subscribe_question(user_id)
-
-        elif 'action' in payload and payload['action'].startswith('subscribe_'):
-            if state != 'subscribe':
-                logger.warning(f"Пользователь {user_id} нажал кнопку подписки, но состояние {state}")
-                return
-            subscribed = (payload['action'] == 'subscribe_yes')
-            set_subscription(user_id, subscribed)
-
-            answers = self.user_temp_data[user_id].get('survey_answers', {})
-            question_map = {
-                'q1': 'Есть ли у вас сайт?',
-                'q2': 'Нужно ли провести аудит сайта?',
-                'q3': 'Требуется ли переделать контент?',
-                'q4': 'Вам нужна реклама или только аудит?'
-            }
-            for q_key, answer in answers.items():
-                if q_key in question_map:
-                    save_answer(user_id, question_map[q_key], answer)
-
-            if answers:
-                emoji_map = {
-                    'Есть ли у вас сайт?': '🌐',
-                    'Нужно ли провести аудит сайта?': '🔍',
-                    'Требуется ли переделать контент?': '📝',
-                    'Вам нужна реклама или только аудит?': '📊'
-                }
-                answers_text = '\n'.join([
-                    f"{emoji_map.get(question_map[q], '•')} {question_map[q]}: {ans}"
-                    for q, ans in answers.items()
-                ])
-                admin_msg = (
-                    f"📝 **Новый опрос пройден**\n"
-                    f"👤 Пользователь: {user['first_name']} {user['last_name']} (id{user_id})\n"
-                    f"📋 **Ответы:**\n{answers_text}"
-                )
-                self.notify_admins(admin_msg)
-
-            if user_id in self.user_temp_data:
-                del self.user_temp_data[user_id]
-            clear_user_state(user_id)
-
-            if subscribed:
-                msg = "🔔 Отлично! Вы подписались на акции. Будем присылать самое интересное."
-            else:
-                msg = "⏸️ Хорошо, если передумаете - всегда можете написать мне."
-            self.send_message(user_id, msg, get_empty_keyboard())
-            self.send_main_menu(user_id)
-
-    def get_updated_keyboard(self, q_state, selected_opt):
-        if q_state == 'q1':
-            return get_q1_inline_keyboard(selected_opt)
-        elif q_state == 'q2':
-            return get_q2_inline_keyboard(selected_opt)
-        elif q_state == 'q3':
-            return get_q3_inline_keyboard(selected_opt)
-        elif q_state == 'q4':
-            return get_q4_inline_keyboard(selected_opt)
-        return None
-
-    def send_survey_question(self, user_id, q_state):
-        if q_state == 'q1':
-            msg = "🔹 **Вопрос 1 из 4**\nЕсть ли у вас сайт?"
-            kb = get_q1_inline_keyboard()
-        elif q_state == 'q2':
-            msg = "🔹 **Вопрос 2 из 4**\nНужно ли провести аудит сайта?"
-            kb = get_q2_inline_keyboard()
-        elif q_state == 'q3':
-            msg = "🔹 **Вопрос 3 из 4**\nТребуется ли переделать контент?"
-            kb = get_q3_inline_keyboard()
-        elif q_state == 'q4':
-            msg = "🔹 **Вопрос 4 из 4**\nВам нужна реклама или только аудит?"
-            kb = get_q4_inline_keyboard()
-        else:
-            return
-        self.send_message(user_id, msg, keyboard=kb)
-
-    def send_subscribe_question(self, user_id):
-        msg = ("✅ Спасибо за ответы! Мы свяжемся с вами в ближайшее время.\n\n"
-               "Хотите получать информацию о наших акциях?")
-        kb = get_subscribe_inline_keyboard()
-        self.send_message(user_id, msg, keyboard=kb)
-
-    def get_next_state(self, current_q):
-        states = ['q1', 'q2', 'q3', 'q4']
-        try:
-            idx = states.index(current_q)
-            if idx < len(states) - 1:
-                return states[idx + 1]
-        except ValueError:
-            pass
-        return None
-
-    def get_prev_state(self, current_q):
-        states = ['q1', 'q2', 'q3', 'q4']
-        try:
-            idx = states.index(current_q)
-            if idx > 0:
-                return states[idx - 1]
-        except ValueError:
-            pass
-        return None
 
     def handle_message(self, event):
         user_id = event.message['from_id']
-        text = event.message['text'].strip().lower()
+        text = event.message['text'].strip()
         first_name = event.message.get('first_name', '')
         last_name = event.message.get('last_name', '')
         user = get_or_create_user(user_id, first_name, last_name)
 
         if is_user_blocked(user_id):
-            logger.info(f"Заблокированный пользователь {user_id} попытался отправить сообщение. Игнорируем.")
+            logger.info(f"Заблокированный пользователь {user_id} игнорируется")
             return
 
-        # Обработка триггерной фразы "скидка 10 процентов"
-        if PROMO_TRIGGER_PHRASE in text:
-            self.send_message(user_id, PROMO_MESSAGE)
-            # Не возвращаемся, чтобы дать возможность обработать и другие команды, но чтобы не зацикливать,
-            # лучше просто отправить и продолжить, но если нужно, можно здесь сделать return.
-            # Поскольку это не команда, а просто текст, оставим без return.
+        # Проверка таймаута
+        if user['current_state']:
+            last_interaction = datetime.strptime(user['last_interaction'], '%Y-%m-%d %H:%M:%S')
+            if datetime.now() - last_interaction > timedelta(minutes=TIMEOUT_MINUTES):
+                logger.info(f"Таймаут для {user_id}, сброс")
+                if user_id in self.user_temp_data:
+                    del self.user_temp_data[user_id]
+                clear_user_state(user_id)
+                self.send_message(user_id, "⏳ Время ожидания истекло. Возвращаю в главное меню.")
+                self.send_main_menu(user_id)
+                return
 
-        if self.check_timeout_and_reset(user_id, user):
-            return
-
+        # Уведомление админов о сообщении
         if not is_admin(user_id) and not text.startswith('/'):
             self.notify_admins(
-                f"📩 **Новое сообщение**\n"
-                f"От: {first_name} {last_name} (id{user_id})\n"
-                f"Текст: {text}"
+                f"📩 **Новое сообщение**\nОт: {first_name} {last_name} (id{user_id})\nТекст: {text}"
             )
 
+        # Обработка команд
         if text.lower() == 'меню':
-            if user_id in self.user_temp_data:
-                del self.user_temp_data[user_id]
-            clear_user_state(user_id)
+            self.reset_user(user_id)
             self.send_main_menu(user_id)
             return
 
-        if user_id in self.admin_states:
-            self.handle_admin_state_input(event)
+        # Если пользователь находится в диалоге с каким-то ботом
+        if user['current_state'] and user['bot_name']:
+            bot_name = user['bot_name']
+            if bot_name in self.bots:
+                bot_instance = self.bots[bot_name](self, user_id)
+                bot_instance.handle_message(text, user['current_state'])
+            else:
+                logger.warning(f"Неизвестный бот {bot_name}, сброс")
+                self.reset_user(user_id)
+                self.send_main_menu(user_id)
             return
 
-        if text.startswith('/') and is_admin(user_id):
-            self.process_admin_command(event)
-            return
-
-        if user['current_state'] and user['current_state'].startswith('q'):
-            self.send_message(user_id, "Пожалуйста, используйте кнопки для ответа.")
-            return
-        elif user['current_state'] == 'subscribe':
-            self.send_message(user_id, "Пожалуйста, используйте кнопки для ответа.")
-            return
-
-        if user['current_state'] in ('request_name', 'request_phone', 'request_email'):
-            self.handle_request_response(event, user)
-            return
-
+        # Обработка кнопок главного меню
         if text == '📢 Акции':
             self.show_promotions(user_id)
         elif text == '📝 Отправить заявку':
             self.start_request(user_id)
-        elif text == '❓ Пройти опрос':
-            self.start_survey(user_id)
+        elif text == '🤖 Боты':
+            self.show_bots_menu(user_id)
         else:
             self.send_main_menu(user_id)
 
-    # ============= МЕТОДЫ ДЛЯ ОБЫЧНЫХ ПОЛЬЗОВАТЕЛЕЙ =========================
+    def handle_callback(self, event):
+        user_id = event.object['user_id']
+        payload = event.object['payload']
+        user = get_or_create_user(user_id)
+
+        if is_user_blocked(user_id):
+            return
+
+        # Обработка выбора бота
+        if payload.get('type') == 'select_bot':
+            bot_key = payload.get('bot')
+            if bot_key in self.bots:
+                # Сохраняем выбранного бота во временные данные и запрашиваем согласие
+                self.user_temp_data[user_id] = {'selected_bot': bot_key}
+                self.send_message(user_id,
+                    f"Вы выбрали бота **{self.get_bot_name(bot_key)}**. Вы согласны на сбор и обработку ваших данных?",
+                    keyboard=get_yes_no_keyboard())
+            else:
+                self.send_message(user_id, "Неизвестный бот.")
+            return
+
+        # Обработка согласия/отказа
+        elif payload.get('type') == 'consent':
+            answer = payload.get('answer')
+            selected_bot = self.user_temp_data.get(user_id, {}).get('selected_bot')
+            if not selected_bot:
+                self.send_message(user_id, "Что-то пошло не так. Попробуйте выбрать бота заново.")
+                self.show_bots_menu(user_id)
+                return
+
+            if answer == 'yes':
+                # Запускаем бота
+                bot_instance = self.bots[selected_bot](self, user_id)
+                bot_instance.start()
+                # Удаляем временные данные
+                if user_id in self.user_temp_data:
+                    del self.user_temp_data[user_id]
+            else:
+                self.send_message(user_id, "Хорошо, возвращаемся в меню ботов.")
+                self.show_bots_menu(user_id)
+                if user_id in self.user_temp_data:
+                    del self.user_temp_data[user_id]
+            return
+
+        # Обработка возврата в главное меню
+        elif payload.get('type') == 'main_menu':
+            self.send_main_menu(user_id)
+            return
+
+    def get_bot_name(self, bot_key):
+        names = {
+            "bot_survey": "Опрос по продвижению",
+            "bot_hairdresser": "Запись в парикмахерскую",
+            "bot_septic": "Септик и откачка",
+            "bot_roof": "Замер кровли и стройматериалы",
+            "bot_bankruptcy": "Банкротство",
+            "bot_valuation": "Независимая оценка",
+        }
+        return names.get(bot_key, "Неизвестный бот")
+
+    def reset_user(self, user_id):
+        if user_id in self.user_temp_data:
+            del self.user_temp_data[user_id]
+        clear_user_state(user_id)
+
     def send_main_menu(self, user_id):
         msg = (
-            "🌟 **Добро пожаловать!** Я помогу вам подобрать услуги для продвижения вашего сайта.\n\n"
+            "🌟 **Добро пожаловать!** Я — многофункциональный бот.\n"
             "Выберите действие:\n"
             "─────────────────────\n"
             "📢 **Акции** – посмотреть текущие предложения\n"
             "📝 **Отправить заявку** – оставить контакт для связи\n"
-            "❓ **Пройти опрос** – ответить на несколько вопросов, чтобы мы лучше поняли ваши потребности"
+            "🤖 **Боты** – запустить одного из специализированных ботов"
         )
         kb = get_main_menu_keyboard()
         self.send_message(user_id, msg, kb)
 
+    def show_bots_menu(self, user_id):
+        msg = "Выберите бота, которого хотите запустить:"
+        kb = get_bots_menu_keyboard()
+        self.send_message(user_id, msg, keyboard=kb)
+
     def show_promotions(self, user_id):
-        promos = get_active_promotions()
-        if not promos:
-            msg = "📢 На данный момент нет активных акций."
-            self.send_message(user_id, msg)
-        else:
-            lines = ["🎁 **Актуальные акции:**\n"]
-            for p in promos:
-                lines.append(
-                    f"**{p['title']}**\n"
-                    f"{p['text']}\n"
-                    f"📅 Срок: {p['start_date']} — {p['end_date']}\n"
-                    f"{'─'*30}"
-                )
-            full_msg = '\n'.join(lines)
-            self.send_message(user_id, full_msg)
+        # заглушка – можно загрузить из БД
+        self.send_message(user_id, "📢 Акции:\nСкоро появятся...")
         self.send_main_menu(user_id)
 
     def start_request(self, user_id):
-        self.user_temp_data[user_id] = {}
-        update_user_state(user_id, 'request_name')
-        msg = "📝 Введите ваше имя:"
-        self.send_message(user_id, msg, get_empty_keyboard())
+        # стандартный сбор контактов (имя, телефон, email)
+        self.user_temp_data[user_id] = {'request': {}}
+        update_user_state(user_id, 'request_name', 'request')
+        self.send_message(user_id, "📝 Введите ваше имя:", get_empty_keyboard())
 
     def handle_request_response(self, event, user):
-        user_id = user['vk_id']
-        state = user['current_state']
-        text = event.message['text'].strip()
+        # этот метод используется только если мы в состоянии request_name и т.п.
+        # но мы не вызываем его в handle_message, потому что если пользователь в состоянии с bot_name='request', то он попадёт в ветку для ботов,
+        # а у нас нет бота с именем 'request'. Поэтому обработаем здесь же.
+        # Можно добавить отдельный обработчик для состояния request.
+        pass
 
-        if user_id not in self.user_temp_data:
-            self.user_temp_data[user_id] = {}
-
-        if state == 'request_name':
-            self.user_temp_data[user_id]['name'] = text
-            update_user_state(user_id, 'request_phone')
-            self.send_message(user_id, "📞 Введите ваш контактный телефон:", get_empty_keyboard())
-
-        elif state == 'request_phone':
-            if 'name' not in self.user_temp_data[user_id]:
-                logger.warning(f"Для пользователя {user_id} отсутствует имя в состоянии request_phone. Сброс.")
-                clear_user_state(user_id)
-                self.start_request(user_id)
-                return
-            self.user_temp_data[user_id]['phone'] = text
-            update_user_state(user_id, 'request_email')
-            self.send_message(user_id, "📧 Введите ваш email:", get_empty_keyboard())
-
-        elif state == 'request_email':
-            if 'name' not in self.user_temp_data[user_id] or 'phone' not in self.user_temp_data[user_id]:
-                logger.warning(f"Для пользователя {user_id} отсутствуют имя или телефон в состоянии request_email. Сброс.")
-                clear_user_state(user_id)
-                self.start_request(user_id)
-                return
-            self.user_temp_data[user_id]['email'] = text
-            data = self.user_temp_data.pop(user_id, {})
-            name = data.get('name', '')
-            phone = data.get('phone', '')
-            email = data.get('email', '')
-            full_request = f"Имя: {name}\nТелефон: {phone}\nEmail: {email}"
-            user_info = save_request(user_id, full_request)
-
-            notification = (
-                f"📬 **Новая заявка** от пользователя\n"
-                f"ID: {user_id}\n"
-                f"Имя: {user_info['first_name']} {user_info['last_name']}\n"
-                f"{full_request}"
-            )
-            self.notify_admins(notification)
-
-            self.send_message(user_id, "✅ Спасибо! Мы свяжемся с вами в ближайшее время.", get_empty_keyboard())
-            clear_user_state(user_id)
-            self.send_main_menu(user_id)
-
-    def start_survey(self, user_id):
-        self.user_temp_data[user_id] = {'survey_answers': {}}
-        update_user_state(user_id, 'q1')
-        self.send_survey_question(user_id, 'q1')
-
-    # ---------- Методы для отложенных рассылок ----------
-    def send_promotion_to_all_subscribers(self, promotion_text):
-        """Отправляет промо-сообщение всем подписчикам."""
-        subscribers = get_subscribers()
-        if not subscribers:
-            logger.info("Нет подписчиков для отправки промо.")
-            return
-        for sub in subscribers:
-            self.send_message(sub['vk_id'], promotion_text)
-            time.sleep(0.1)  # небольшая задержка, чтобы не превысить лимиты
-
-    def schedule_promotions(self):
-        """Запускает таймеры для отложенных рассылок."""
-        # Первая рассылка через 10 секунд после запуска бота
-        timer1 = threading.Timer(10.0, self.send_promotion_to_all_subscribers, args=(PROMO_MESSAGE,))
-        timer1.daemon = True
-        timer1.start()
-        logger.info("Запланирована рассылка промо через 10 секунд.")
-
-        # Вторая рассылка через 7 дней (604800 секунд)
-        timer2 = threading.Timer(604800.0, self.send_promotion_to_all_subscribers, args=(PROMO_MESSAGE,))
-        timer2.daemon = True
-        timer2.start()
-        logger.info("Запланирована повторная рассылка промо через 7 дней.")
-
-    # ============= АДМИНИСТРИРОВАНИЕ ========================================
+    # ============= АДМИНИСТРИРОВАНИЕ (сокращённо) ==========================
     def process_admin_command(self, event):
-        user_id = event.message['from_id']
-        text = event.message['text'].strip()
-        parts = text.split()
-        cmd = parts[0].lower()
-        args = parts[1:]
-
-        if user_id in self.admin_states:
-            self.handle_admin_state_input(event)
-            return
-
-        if cmd in ('/admin', '/adminka', '/start', '/help'):
-            self.show_admin_panel(user_id)
-        elif cmd == '/stats':
-            self.admin_stats(user_id)
-        elif cmd == '/answers':
-            self.admin_answers(user_id, args)
-        elif cmd == '/export':
-            self.admin_export(user_id)
-        elif cmd == '/add_promo':
-            self.start_add_promo(user_id)
-        elif cmd == '/list_promo':
-            self.admin_list_promos(user_id)
-        elif cmd == '/edit_promo':
-            if len(args) < 1:
-                self.send_message(user_id, "Использование: /edit_promo <id>")
-                return
-            try:
-                promo_id = int(args[0])
-                self.start_edit_promo(user_id, promo_id)
-            except ValueError:
-                self.send_message(user_id, "ID акции должен быть числом.")
-        elif cmd == '/delete_promo':
-            if len(args) < 1:
-                self.send_message(user_id, "Использование: /delete_promo <id>")
-                return
-            try:
-                promo_id = int(args[0])
-                self.start_delete_promo(user_id, promo_id)
-            except ValueError:
-                self.send_message(user_id, "ID акции должен быть числом.")
-        elif cmd == '/send_promo':
-            if len(args) < 1:
-                self.send_message(user_id, "Использование: /send_promo <id>")
-                return
-            try:
-                promo_id = int(args[0])
-                self.start_manual_send(user_id, promo_id)
-            except ValueError:
-                self.send_message(user_id, "ID акции должен быть числом.")
-        elif cmd == '/set_mailing_time':
-            if len(args) < 1:
-                self.send_message(user_id, "Использование: /set_mailing_time <HH:MM>")
-                return
-            self.admin_set_mailing_time(user_id, args[0])
-        elif cmd == '/reply':
-            if len(args) < 2:
-                self.send_message(user_id, "Использование: /reply <vk_id> <текст>")
-                return
-            target_vk_id = args[0]
-            reply_text = ' '.join(args[1:])
-            self.admin_reply(user_id, target_vk_id, reply_text)
-        elif cmd == '/disable':
-            self.admin_disable(user_id)
-        elif cmd == '/enable':
-            self.admin_enable(user_id)
-        elif cmd == '/users':
-            self.admin_list_users(user_id, args)
-        elif cmd == '/subscribe':
-            if len(args) < 2:
-                self.send_message(user_id, "Использование: /subscribe <vk_id> <1/0>")
-                return
-            try:
-                target_id = int(args[0])
-                sub_val = int(args[1])
-                self.admin_manage_subscription(user_id, target_id, sub_val)
-            except ValueError:
-                self.send_message(user_id, "ID должен быть числом, подписка 1 или 0.")
-        elif cmd == '/block':
-            if len(args) < 1:
-                self.send_message(user_id, "Использование: /block <vk_id>")
-                return
-            try:
-                target_id = int(args[0])
-                self.admin_block_user(user_id, target_id)
-            except ValueError:
-                self.send_message(user_id, "ID должен быть числом.")
-        elif cmd == '/unblock':
-            if len(args) < 1:
-                self.send_message(user_id, "Использование: /unblock <vk_id>")
-                return
-            try:
-                target_id = int(args[0])
-                self.admin_unblock_user(user_id, target_id)
-            except ValueError:
-                self.send_message(user_id, "ID должен быть числом.")
-        else:
-            self.handle_admin_button(user_id, text)
-
-    def handle_admin_button(self, user_id, button_text):
-        if button_text == '📊 Статистика':
-            self.admin_stats(user_id)
-        elif button_text == '📋 Ответы':
-            self.admin_answers(user_id, [])
-        elif button_text == '📤 Экспорт данных':
-            self.admin_export(user_id)
-        elif button_text == '➕ Добавить акцию':
-            self.start_add_promo(user_id)
-        elif button_text == '📋 Список акций':
-            self.admin_list_promos(user_id)
-        elif button_text == '✏️ Редактировать акцию':
-            self.send_message(user_id, "Введите ID акции для редактирования:")
-            self.admin_states[user_id] = {'action': 'edit_promo_input_id', 'step': 0}
-        elif button_text == '❌ Удалить акцию':
-            self.send_message(user_id, "Введите ID акции для удаления:")
-            self.admin_states[user_id] = {'action': 'delete_promo_input_id', 'step': 0}
-        elif button_text == '📨 Разослать акцию':
-            self.send_message(user_id, "Введите ID акции для ручной рассылки:")
-            self.admin_states[user_id] = {'action': 'manual_send_input_id', 'step': 0}
-        elif button_text == '⏰ Установить время':
-            self.send_message(user_id, "Введите новое время рассылки в формате HH:MM (например, 10:00):")
-            self.admin_states[user_id] = {'action': 'set_mailing_time_input', 'step': 0}
-        elif button_text == '👥 Пользователи':
-            self.admin_list_users(user_id, [])
-        elif button_text == '🔒 Блокировка':
-            self.send_message(user_id, "Введите ID пользователя для блокировки (команда /block <id>):")
-            self.admin_states[user_id] = {'action': 'block_input', 'step': 0}
-        elif button_text == '📧 Подписки':
-            self.send_message(user_id, "Введите ID пользователя и статус подписки (1 или 0) через пробел, например: 123456789 1")
-            self.admin_states[user_id] = {'action': 'subscribe_input', 'step': 0}
-        elif button_text == '💬 Ответить пользователю':
-            self.send_message(user_id, "Введите ID пользователя VK и текст сообщения через пробел (например, 123456789 Привет!):")
-            self.admin_states[user_id] = {'action': 'reply_input', 'step': 0}
-        elif button_text == '🚫 Отключить бота':
-            self.admin_disable(user_id)
-        elif button_text == '✅ Включить бота':
-            self.admin_enable(user_id)
-        elif button_text == '🔙 Главное меню':
-            self.send_main_menu(user_id)
-        else:
-            self.show_admin_panel(user_id)
-
-    def handle_admin_state_input(self, event):
-        user_id = event.message['from_id']
-        text = event.message['text'].strip()
-        state = self.admin_states.get(user_id)
-        if not state:
-            return
-
-        action = state['action']
-
-        if action == 'add_promo':
-            self.handle_add_promo_input(user_id, text, state)
-        elif action == 'edit_promo':
-            self.handle_edit_promo_input(user_id, text, state)
-        elif action == 'edit_promo_input_id':
-            try:
-                promo_id = int(text)
-                self.start_edit_promo(user_id, promo_id)
-            except ValueError:
-                self.send_message(user_id, "ID должен быть числом. Попробуйте снова.")
-                del self.admin_states[user_id]
-                self.show_admin_panel(user_id)
-        elif action == 'delete_promo_input_id':
-            try:
-                promo_id = int(text)
-                self.start_delete_promo(user_id, promo_id)
-            except ValueError:
-                self.send_message(user_id, "ID должен быть числом. Попробуйте снова.")
-                del self.admin_states[user_id]
-                self.show_admin_panel(user_id)
-        elif action == 'manual_send_input_id':
-            try:
-                promo_id = int(text)
-                self.start_manual_send(user_id, promo_id)
-            except ValueError:
-                self.send_message(user_id, "ID должен быть числом. Попробуйте снова.")
-                del self.admin_states[user_id]
-                self.show_admin_panel(user_id)
-        elif action == 'set_mailing_time_input':
-            self.admin_set_mailing_time(user_id, text)
-            del self.admin_states[user_id]
-            self.show_admin_panel(user_id)
-        elif action == 'reply_input':
-            parts = text.split(maxsplit=1)
-            if len(parts) < 2:
-                self.send_message(user_id, "Нужно указать ID и текст. Пример: 123456789 Привет!")
-                return
-            target_id, reply_text = parts[0], parts[1]
-            self.admin_reply(user_id, target_id, reply_text)
-            del self.admin_states[user_id]
-            self.show_admin_panel(user_id)
-        elif action == 'block_input':
-            try:
-                target_id = int(text)
-                self.admin_block_user(user_id, target_id)
-            except ValueError:
-                self.send_message(user_id, "ID должен быть числом.")
-            del self.admin_states[user_id]
-            self.show_admin_panel(user_id)
-        elif action == 'subscribe_input':
-            parts = text.split()
-            if len(parts) < 2:
-                self.send_message(user_id, "Нужно указать ID и статус. Пример: 123456789 1")
-                return
-            try:
-                target_id = int(parts[0])
-                sub_val = int(parts[1])
-                self.admin_manage_subscription(user_id, target_id, sub_val)
-            except ValueError:
-                self.send_message(user_id, "ID и статус должны быть числами.")
-            del self.admin_states[user_id]
-            self.show_admin_panel(user_id)
-        else:
-            logger.warning(f"Неизвестное действие админа {action}")
-            del self.admin_states[user_id]
-            self.show_admin_panel(user_id)
-
-    def show_admin_panel(self, user_id):
-        msg = (
-            "🔧 **АДМИНИСТРИРОВАНИЕ**\n"
-            "══════════════════════════════\n"
-            "👤 **Пользовательские функции**\n"
-            "(доступны также обычным пользователям)\n"
-            "────────────────────────\n"
-            "📢 Акции\n"
-            "📝 Отправить заявку\n"
-            "❓ Пройти опрос\n\n"
-            "⚙️ **Управление ботом**\n"
-            "────────────────────────\n"
-            "📊 Статистика\n"
-            "📋 Ответы\n"
-            "📤 Экспорт данных\n"
-            "➕ Добавить акцию\n"
-            "📋 Список акций\n"
-            "✏️ Редактировать акцию\n"
-            "❌ Удалить акцию\n"
-            "📨 Разослать акцию вручную\n"
-            "⏰ Установить время рассылки\n"
-            "👥 Пользователи\n"
-            "🔒 Блокировка\n"
-            "📧 Подписки\n"
-            "💬 Ответить пользователю\n"
-            "🚫 Отключить бота\n"
-            "✅ Включить бота\n\n"
-            "Используйте кнопки ниже для выбора действия."
-        )
-        kb = get_admin_keyboard()
-        self.send_message(user_id, msg, kb)
-
-    def admin_stats(self, user_id):
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute('SELECT COUNT(*) as total FROM users')
-        total = cur.fetchone()['total']
-        cur.execute('SELECT COUNT(*) as total FROM users WHERE subscribed = 1')
-        subscribed = cur.fetchone()['total']
-        cur.execute('SELECT COUNT(DISTINCT user_id) as total FROM survey_answers')
-        surveyed = cur.fetchone()['total']
-        cur.execute('SELECT COUNT(*) as total FROM users WHERE is_blocked = 1')
-        blocked = cur.fetchone()['total']
-        conn.close()
-        msg = (f"📊 **Статистика**\n"
-               f"Всего пользователей: {total}\n"
-               f"Прошли опрос: {surveyed}\n"
-               f"Подписаны на акции: {subscribed}\n"
-               f"Заблокировано: {blocked}")
-        self.send_message(user_id, msg)
-        log_admin_action(user_id, 'stats', msg)
-        self.show_admin_panel(user_id)
-
-    def admin_answers(self, user_id, args):
-        date_filter = None
-        if args and args[0]:
-            date_filter = args[0]
-        conn = get_db_connection()
-        cur = conn.cursor()
-        if date_filter:
-            cur.execute('''
-                SELECT u.vk_id, u.first_name, u.last_name, sa.question, sa.answer, sa.answered_at
-                FROM survey_answers sa
-                JOIN users u ON sa.user_id = u.id
-                WHERE DATE(sa.answered_at) = ?
-                ORDER BY sa.answered_at DESC
-            ''', (date_filter,))
-        else:
-            cur.execute('''
-                SELECT u.vk_id, u.first_name, u.last_name, sa.question, sa.answer, sa.answered_at
-                FROM survey_answers sa
-                JOIN users u ON sa.user_id = u.id
-                ORDER BY sa.answered_at DESC
-                LIMIT 50
-            ''')
-        rows = cur.fetchall()
-        conn.close()
-        if not rows:
-            self.send_message(user_id, "Нет ответов за указанный период.")
-        else:
-            msg_lines = ["📝 **Ответы пользователей**:"]
-            for row in rows:
-                line = (f"[{row['answered_at']}] {row['first_name']} {row['last_name']} (id{row['vk_id']}):\n"
-                        f"  {row['question']} → {row['answer']}")
-                msg_lines.append(line)
-            chunk_size = 5
-            for i in range(0, len(msg_lines), chunk_size):
-                chunk = '\n\n'.join(msg_lines[i:i+chunk_size])
-                self.send_message(user_id, chunk)
-        log_admin_action(user_id, 'answers', f"date={date_filter if date_filter else 'all'}")
-        self.show_admin_panel(user_id)
-
-    def admin_export(self, user_id):
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute('''
-            SELECT u.vk_id, u.first_name, u.last_name, u.first_seen, u.last_interaction, u.subscribed,
-                   sa.question, sa.answer, sa.answered_at
-            FROM users u
-            LEFT JOIN survey_answers sa ON u.id = sa.user_id
-            ORDER BY u.vk_id, sa.answered_at
-        ''')
-        rows = cur.fetchall()
-        conn.close()
-        if not rows:
-            self.send_message(user_id, "Нет данных для экспорта.")
-            self.show_admin_panel(user_id)
-            return
-
-        output = io.StringIO()
-        writer = csv.writer(output, delimiter=',', quoting=csv.QUOTE_MINIMAL)
-        writer.writerow(['vk_id', 'first_name', 'last_name', 'first_seen', 'last_interaction', 'subscribed',
-                         'question', 'answer', 'answered_at'])
-        for row in rows:
-            writer.writerow([row['vk_id'], row['first_name'], row['last_name'], row['first_seen'],
-                             row['last_interaction'], row['subscribed'], row['question'], row['answer'],
-                             row['answered_at']])
-        csv_data = output.getvalue().encode('utf-8-sig')
-        output.close()
-
-        try:
-            doc = self.upload.document_message(
-                peer_id=user_id,
-                file=io.BytesIO(csv_data),
-                title='survey_export.csv'
-            )
-            attachment = f"doc{doc['doc']['owner_id']}_{doc['doc']['id']}"
-            self.send_message(user_id, "Файл с данными:", attachment=attachment)
-            log_admin_action(user_id, 'export', 'CSV exported')
-        except Exception as e:
-            logger.error(f"Ошибка загрузки документа: {e}")
-            self.send_message(user_id, f"Не удалось загрузить файл. Ошибка: {e}")
-        self.show_admin_panel(user_id)
-
-    # ---------- Управление акциями ----------
-    def start_add_promo(self, user_id):
-        self.admin_states[user_id] = {'action': 'add_promo', 'step': 1, 'data': {}}
-        self.send_message(user_id, "Введите **название** акции:")
-
-    def handle_add_promo_input(self, user_id, text, state):
-        step = state['step']
-        data = state['data']
-
-        if step == 1:
-            data['title'] = text
-            state['step'] = 2
-            self.send_message(user_id, "Введите **текст** акции (описание, условия):")
-        elif step == 2:
-            data['text'] = text
-            state['step'] = 3
-            self.send_message(user_id, "Введите **дату начала** в формате ГГГГ-ММ-ДД (например, 2025-04-01):")
-        elif step == 3:
-            try:
-                datetime.strptime(text, '%Y-%m-%d')
-                data['start_date'] = text
-                state['step'] = 4
-                self.send_message(user_id, "Введите **дату окончания** в формате ГГГГ-ММ-ДД:")
-            except ValueError:
-                self.send_message(user_id, "Неверный формат даты. Повторите ввод (ГГГГ-ММ-ДД):")
-                return
-        elif step == 4:
-            try:
-                datetime.strptime(text, '%Y-%m-%d')
-                data['end_date'] = text
-                state['step'] = 5
-                self.send_message(user_id, "Введите **периодичность** (daily или weekly):")
-            except ValueError:
-                self.send_message(user_id, "Неверный формат даты. Повторите ввод (ГГГГ-ММ-ДД):")
-                return
-        elif step == 5:
-            if text.lower() not in ['daily', 'weekly']:
-                self.send_message(user_id, "Периодичность должна быть 'daily' или 'weekly'. Повторите:")
-                return
-            data['periodicity'] = text.lower()
-            promo_id = add_promotion(data['title'], data['text'], data['start_date'], data['end_date'], data['periodicity'])
-            self.send_message(user_id, f"✅ Акция успешно добавлена! ID: {promo_id}")
-            log_admin_action(user_id, 'add_promo', f"promo_id={promo_id}, title={data['title']}")
-            del self.admin_states[user_id]
-            self.show_admin_panel(user_id)
-
-    def start_edit_promo(self, user_id, promo_id):
-        promo = get_promotion(promo_id)
-        if not promo:
-            self.send_message(user_id, f"Акция с ID {promo_id} не найдена.")
-            self.show_admin_panel(user_id)
-            return
-        self.admin_states[user_id] = {'action': 'edit_promo', 'step': 1, 'data': promo, 'promo_id': promo_id}
-        self.send_message(user_id, f"Редактирование акции ID {promo_id}\n"
-                                   f"Текущее название: {promo['title']}\n"
-                                   "Введите новое название (или отправьте 'пропустить'):")
-
-    def handle_edit_promo_input(self, user_id, text, state):
-        step = state['step']
-        promo_id = state['promo_id']
-        current = state['data']
-
-        if step == 1:
-            if text.lower() != 'пропустить':
-                update_promotion(promo_id, title=text)
-                current['title'] = text
-            state['step'] = 2
-            self.send_message(user_id, f"Текущий текст: {current['text']}\nВведите новый текст акции (или 'пропустить'):")
-        elif step == 2:
-            if text.lower() != 'пропустить':
-                update_promotion(promo_id, text=text)
-                current['text'] = text
-            state['step'] = 3
-            self.send_message(user_id, f"Текущая дата начала: {current['start_date']}\nВведите новую дату начала (ГГГГ-ММ-ДД) или 'пропустить':")
-        elif step == 3:
-            if text.lower() != 'пропустить':
-                try:
-                    datetime.strptime(text, '%Y-%m-%d')
-                    update_promotion(promo_id, start_date=text)
-                    current['start_date'] = text
-                except ValueError:
-                    self.send_message(user_id, "Неверный формат даты. Поле не обновлено.")
-            state['step'] = 4
-            self.send_message(user_id, f"Текущая дата окончания: {current['end_date']}\nВведите новую дату окончания (ГГГГ-ММ-ДД) или 'пропустить':")
-        elif step == 4:
-            if text.lower() != 'пропустить':
-                try:
-                    datetime.strptime(text, '%Y-%m-%d')
-                    update_promotion(promo_id, end_date=text)
-                    current['end_date'] = text
-                except ValueError:
-                    self.send_message(user_id, "Неверный формат даты. Поле не обновлено.")
-            state['step'] = 5
-            self.send_message(user_id, f"Текущая периодичность: {current['periodicity']}\nВведите новую периодичность (daily/weekly) или 'пропустить':")
-        elif step == 5:
-            if text.lower() != 'пропустить' and text.lower() in ['daily', 'weekly']:
-                update_promotion(promo_id, periodicity=text.lower())
-                current['periodicity'] = text.lower()
-            elif text.lower() != 'пропустить':
-                self.send_message(user_id, "Неверное значение. Поле не обновлено.")
-            self.send_message(user_id, f"✅ Акция ID {promo_id} успешно отредактирована.")
-            log_admin_action(user_id, 'edit_promo', f"promo_id={promo_id}")
-            del self.admin_states[user_id]
-            self.show_admin_panel(user_id)
-
-    def start_delete_promo(self, user_id, promo_id):
-        promo = get_promotion(promo_id)
-        if not promo:
-            self.send_message(user_id, f"Акция с ID {promo_id} не найдена.")
-            self.show_admin_panel(user_id)
-            return
-        delete_promotion(promo_id)
-        self.send_message(user_id, f"✅ Акция ID {promo_id} удалена.")
-        log_admin_action(user_id, 'delete_promo', f"promo_id={promo_id}")
-        self.show_admin_panel(user_id)
-
-    def start_manual_send(self, user_id, promo_id):
-        promo = get_promotion(promo_id)
-        if not promo:
-            self.send_message(user_id, f"Акция с ID {promo_id} не найдена.")
-            self.show_admin_panel(user_id)
-            return
-        subscribers = get_subscribers()
-        if not subscribers:
-            self.send_message(user_id, "Нет подписчиков для рассылки.")
-            self.show_admin_panel(user_id)
-            return
-        sent_count = 0
-        for sub in subscribers:
-            if promo['periodicity'] == 'daily' and was_sent_today(promo_id, sub['id']):
-                continue
-            if promo['periodicity'] == 'weekly' and was_sent_this_week(promo_id, sub['id']):
-                continue
-            msg = f"🎉 **Акция: {promo['title']}**\n\n{promo['text']}"
-            self.send_message(sub['vk_id'], msg)
-            log_sent(promo_id, sub['id'])
-            sent_count += 1
-            time.sleep(0.3)
-        update_promotion(promo_id, last_sent=datetime.now().isoformat())
-        self.send_message(user_id, f"✅ Рассылка завершена. Отправлено {sent_count} подписчикам.")
-        log_admin_action(user_id, 'manual_send', f"promo_id={promo_id}, sent={sent_count}")
-        self.show_admin_panel(user_id)
-
-    def admin_list_promos(self, user_id):
-        promos = get_all_promotions()
-        if not promos:
-            self.send_message(user_id, "Нет акций.")
-        else:
-            msg_lines = ["📋 **Список акций**:"]
-            for p in promos:
-                status = "🟢 активна" if p['is_active'] else "🔴 неактивна"
-                msg_lines.append(f"ID {p['id']}: {p['title']} ({p['start_date']} - {p['end_date']}) - {status}, период: {p['periodicity']}")
-            self.send_message(user_id, '\n'.join(msg_lines))
-        log_admin_action(user_id, 'list_promo')
-        self.show_admin_panel(user_id)
-
-    def admin_set_mailing_time(self, user_id, time_str):
-        try:
-            datetime.strptime(time_str, '%H:%M')
-            global DEFAULT_MAILING_TIME
-            DEFAULT_MAILING_TIME = time_str
-            self.send_message(user_id, f"⏰ Время автоматической рассылки установлено на {time_str}")
-            log_admin_action(user_id, 'set_mailing_time', time_str)
-        except ValueError:
-            self.send_message(user_id, "Неверный формат времени. Используйте HH:MM (например, 10:00)")
-        self.show_admin_panel(user_id)
-
-    def admin_reply(self, admin_id, target_vk_id, text):
-        try:
-            target_vk_id = int(target_vk_id)
-            self.send_message(target_vk_id, f"📨 **Сообщение от администратора:**\n{text}")
-            self.send_message(admin_id, f"✅ Сообщение отправлено пользователю {target_vk_id}")
-            log_admin_action(admin_id, 'reply', f"to={target_vk_id}, text={text[:50]}...")
-        except ValueError:
-            self.send_message(admin_id, "Неверный ID пользователя. Должен быть числом.")
-        except Exception as e:
-            self.send_message(admin_id, f"Ошибка при отправке: {e}")
-        self.show_admin_panel(admin_id)
-
-    def admin_disable(self, user_id):
-        self.enabled = False
-        self.disabled_until = None
-        self.send_message(user_id, "🚫 Бот отключен. Для включения используйте /enable или кнопку '✅ Включить бота'.")
-        log_admin_action(user_id, 'disable')
-        self.show_admin_panel(user_id)
-
-    def admin_enable(self, user_id):
-        self.enabled = True
-        self.disabled_until = None
-        self.send_message(user_id, "✅ Бот включен.")
-        log_admin_action(user_id, 'enable')
-        self.show_admin_panel(user_id)
-
-    # ---------- Управление пользователями ----------
-    def admin_list_users(self, user_id, args):
-        page = 1
-        if args and args[0].isdigit():
-            page = int(args[0])
-        total = get_total_users()
-        max_page = (total + USERS_PER_PAGE - 1) // USERS_PER_PAGE
-        if page < 1:
-            page = 1
-        if page > max_page and max_page > 0:
-            page = max_page
-
-        users = get_users_page(page, USERS_PER_PAGE)
-        if not users:
-            self.send_message(user_id, "Нет пользователей.")
-        else:
-            lines = [f"👥 **Пользователи (страница {page}/{max_page})**"]
-            for u in users:
-                sub_emoji = "✅" if u['subscribed'] else "❌"
-                block_emoji = "🔒" if u['is_blocked'] else "🟢"
-                last_inter = u['last_interaction'][:16]
-                lines.append(
-                    f"ID {u['vk_id']}: {u['first_name']} {u['last_name']} | "
-                    f"Подписка: {sub_emoji} | Блок: {block_emoji} | Посл.: {last_inter}"
-                )
-            lines.append(f"\nДля перехода к другой странице введите /users N (где N - номер страницы)")
-            self.send_message(user_id, '\n'.join(lines))
-        log_admin_action(user_id, 'list_users', f"page={page}")
-        self.show_admin_panel(user_id)
-
-    def admin_manage_subscription(self, admin_id, target_vk_id, sub_value):
-        if sub_value not in (0, 1):
-            self.send_message(admin_id, "Статус подписки должен быть 1 (подписать) или 0 (отписать).")
-            return
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute('SELECT id FROM users WHERE vk_id = ?', (target_vk_id,))
-        if not cur.fetchone():
-            conn.close()
-            self.send_message(admin_id, f"Пользователь с ID {target_vk_id} не найден в базе.")
-            return
-        conn.close()
-
-        update_subscription_admin(target_vk_id, bool(sub_value))
-        status = "подписан" if sub_value else "отписан"
-        self.send_message(admin_id, f"✅ Пользователь {target_vk_id} успешно {status}.")
-        log_admin_action(admin_id, 'manage_subscription', f"target={target_vk_id}, set={sub_value}")
-        self.show_admin_panel(admin_id)
-
-    def admin_block_user(self, admin_id, target_vk_id):
-        if target_vk_id in ADMIN_IDS:
-            self.send_message(admin_id, "❌ Нельзя заблокировать администратора.")
-            return
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute('SELECT id FROM users WHERE vk_id = ?', (target_vk_id,))
-        if not cur.fetchone():
-            conn.close()
-            self.send_message(admin_id, f"Пользователь с ID {target_vk_id} не найден в базе.")
-            return
-        conn.close()
-
-        set_user_block(target_vk_id, block=True)
-        self.send_message(admin_id, f"🔒 Пользователь {target_vk_id} заблокирован.")
-        log_admin_action(admin_id, 'block_user', f"target={target_vk_id}")
-        self.show_admin_panel(admin_id)
-
-    def admin_unblock_user(self, admin_id, target_vk_id):
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute('SELECT id FROM users WHERE vk_id = ?', (target_vk_id,))
-        if not cur.fetchone():
-            conn.close()
-            self.send_message(admin_id, f"Пользователь с ID {target_vk_id} не найден в базе.")
-            return
-        conn.close()
-
-        set_user_block(target_vk_id, block=False)
-        self.send_message(admin_id, f"🟢 Пользователь {target_vk_id} разблокирован.")
-        log_admin_action(admin_id, 'unblock_user', f"target={target_vk_id}")
-        self.show_admin_panel(admin_id)
-
-    # ============= АВТОМАТИЧЕСКАЯ РАССЫЛКА ===================================
-    def mailing_worker(self):
-        logger.info("Поток рассылки запущен.")
-        while True:
-            try:
-                now = datetime.now()
-                target_time = datetime.strptime(DEFAULT_MAILING_TIME, '%H:%M').time()
-                if now.hour == target_time.hour and now.minute == target_time.minute:
-                    self.perform_mailing()
-                    time.sleep(61)
-                else:
-                    time.sleep(MAILING_CHECK_INTERVAL)
-            except Exception as e:
-                logger.error(f"Ошибка в потоке рассылки: {e}")
-                logger.error(traceback.format_exc())
-                time.sleep(60)
-
-    def perform_mailing(self):
-        logger.info("Запуск автоматической рассылки.")
-        if self.is_bot_disabled():
-            logger.info("Бот отключен, рассылка не производится.")
-            return
-
-        active_promos = get_active_promotions()
-        if not active_promos:
-            logger.info("Нет активных акций для рассылки.")
-            return
-
-        subscribers = get_subscribers()
-        if not subscribers:
-            logger.info("Нет подписчиков.")
-            return
-
-        for sub in subscribers:
-            sent = False
-            for promo in active_promos:
-                promo_id = promo['id']
-                if promo['periodicity'] == 'daily' and was_sent_today(promo_id, sub['id']):
-                    continue
-                if promo['periodicity'] == 'weekly' and was_sent_this_week(promo_id, sub['id']):
-                    continue
-                msg = f"🎉 **Акция: {promo['title']}**\n\n{promo['text']}"
-                self.send_message(sub['vk_id'], msg)
-                log_sent(promo_id, sub['id'])
-                sent = True
-                update_promotion(promo_id, last_sent=datetime.now().isoformat())
-                time.sleep(0.3)
-                break
-            if not sent:
-                logger.debug(f"Пользователь {sub['vk_id']} уже получил все акции в этом периоде.")
-
-        logger.info("Автоматическая рассылка завершена.")
+        # Здесь можно добавить команды админа
+        pass
 
 # ================== ЗАПУСК БОТА ===========================================
 def main():
     init_db()
     bot = VKBot(GROUP_ID, API_TOKEN)
-
-    # Запускаем отложенные рассылки
-    bot.schedule_promotions()
-
-    mailing_thread = threading.Thread(target=bot.mailing_worker, daemon=True)
-    mailing_thread.start()
-
-    logger.info("Бот запущен и ожидает сообщения...")
+    logger.info("Бот запущен")
     while True:
         try:
             for event in bot.longpoll.listen():
                 bot.handle_event(event)
         except Exception as e:
             logger.error(f"Ошибка в основном цикле: {e}")
-            logger.error(traceback.format_exc())
             time.sleep(5)
 
 if __name__ == '__main__':
